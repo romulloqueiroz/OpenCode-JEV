@@ -51,31 +51,37 @@ class Model(BaseHTTPRequestHandler):
   tools=req.get('tools',[])
   tool_names=[x['function']['name'] for x in tools]
   (ROOT/f'request-{state["requests"]}.json').write_text(json.dumps(req,indent=2))
-  final=any('JEV HARNESS FINAL RESULT' in json.dumps(m) for m in msgs)
-  content='JEV local smoke'
+  final=any('The JEV harness has finished' in json.dumps(m) for m in msgs)
+  content='JEV local smoke'; tool_call=None
   worker=any('Generate a structured draft for the JEV harness.' in json.dumps(m) for m in msgs if m.get('role')=='system')
   if worker:
-   state['drafts']+=1
    if state['scenario']=='cancel':
     worker_started.set(); release_worker.wait(20)
    if (PROJECT/'answer.js').read_text() != 'export const answer = 0;\n': state['errors'].append('early file change')
    if req['model'] != 'mock': state['errors'].append('worker model changed')
-   if tool_names: state['errors'].append('worker unexpectedly has workspace tools: '+str(tool_names))
-   revision=state['drafts']>1
-   if revision and not any('JEV feedback on the last attempt' in json.dumps(m) for m in msgs): state['errors'].append('missing feedback')
-   draft={'answer':'SELECTED_FINAL: Updated answer.js.' if revision else 'PRIVATE_DRAFT_BAD', 'files':[{'path':'answer.js','content':f'export const answer = {2 if revision else 1};\n'}]}
-   if state['scenario']=='chat':
-    draft['files']=[]
-    draft['answer']='SELECTED_FINAL:\n```js\nfunction answer() { return 2; }\n```' if revision else 'PRIVATE_DRAFT_BAD: function answer() { return 1; }'
-   content=json.dumps(draft)
+   if 'read' not in tool_names or set(tool_names)-{'read','grep','glob','list'}: state['errors'].append('worker tools are not read-only: '+str(tool_names))
+   if 'export const answer = 0' in json.dumps([m for m in msgs if m.get('role')!='tool']): state['errors'].append('project pasted into worker prompt')
+   if state['scenario']=='files' and not any(m.get('role')=='tool' for m in msgs):
+    # First step: inspect the project with the read tool, as a real worker would.
+    tool_call={'index':0,'id':'call_read','type':'function','function':{'name':'read','arguments':json.dumps({'filePath':str(PROJECT/'answer.js')})}}
+   else:
+    state['drafts']+=1
+    tool_output=json.dumps([m for m in msgs if m.get('role')=='tool'])
+    if state['scenario']=='files' and 'export const answer = 0' not in tool_output: state['errors'].append('read tool did not return the file: '+tool_output[-500:])
+    revision=state['drafts']>1
+    if revision and not any('JEV feedback on the last attempt' in json.dumps(m) for m in msgs): state['errors'].append('missing feedback')
+    draft={'answer':'SELECTED_FINAL: Updated answer.js.' if revision else 'PRIVATE_DRAFT_BAD', 'files':[{'path':'answer.js','edits':[{'search':'answer = 0','replace':f'answer = {2 if revision else 1}'}]}]}
+    if state['scenario']=='chat':
+     draft['files']=[]
+     draft['answer']='SELECTED_FINAL:\n```js\nfunction answer() { return 2; }\n```' if revision else 'PRIVATE_DRAFT_BAD: function answer() { return 1; }'
+    content=json.dumps(draft)
   elif final:
    state['presentations']+=1
-   if 'PRIVATE_DRAFT_BAD' in json.dumps(msgs): state['errors'].append('draft leaked to presenter')
-   if '"decision": "failed"' in json.dumps(msgs) or 'JEV harness failed:' in json.dumps(msgs): state['errors'].append('harness failed: '+json.dumps(msgs)[-3000:])
+   if 'PRIVATE_DRAFT_BAD' in json.dumps(msgs) or 'SELECTED_FINAL' in json.dumps(msgs): state['errors'].append('result sent to presenter model')
    if tool_names: state['errors'].append('presenter unexpectedly has tools: '+str(tool_names))
-   final_message=next(m['content'] for m in msgs if m.get('role')=='user' and 'JEV HARNESS FINAL RESULT' in m.get('content',''))
-   content=json.loads(final_message.split('\n\n')[1])['answer']
-  delta={'role':'assistant','content':content}; finish='stop'
+   # The plugin replaces this acknowledgement with the selected result verbatim.
+   content='Done'
+  delta,finish=({'role':'assistant','tool_calls':[tool_call]},'tool_calls') if tool_call else ({'role':'assistant','content':content},'stop')
   try:
    self.send_response(200); self.send_header('Content-Type','text/event-stream'); self.end_headers()
   except (BrokenPipeError,ConnectionResetError): return
@@ -121,6 +127,8 @@ try:
    messages=api('/session/'+sid+'/message')
    final_text='\n'.join(part.get('text','') for m in messages if m['info']['role']=='assistant' for part in m['parts'] if part['type']=='text')
    if 'SELECTED_FINAL' not in final_text: time.sleep(.1);continue
+   assert 'JEV harness failed' not in final_text,final_text
+   assert final_text.startswith('SELECTED_FINAL: Updated answer.js.') and '**Changed files:** answer.js' in final_text and 'Done' not in final_text,final_text
    assert 'PRIVATE_DRAFT_BAD' not in json.dumps(messages),'private draft leaked into main chat'
    assert len([m for m in messages if m['info']['role']=='user'])==1,'feedback added to main chat'
    assert state['drafts']==2,state
@@ -144,9 +152,10 @@ try:
  while time.monotonic()<deadline:
   messages=api('/session/'+chat+'/message')
   final_text='\n'.join(part.get('text','') for m in messages if m['info']['role']=='assistant' for part in m['parts'] if part['type']=='text')
-  if 'SELECTED_FINAL' in final_text: break
+  if 'SELECTED_FINAL' in final_text or 'JEV harness failed' in final_text: break
   time.sleep(.1)
  else: raise RuntimeError('chat-only refinement did not finish')
+ assert 'JEV harness failed' not in final_text,final_text
  assert not state['errors'],state['errors']
  assert state['drafts']==2,state
  assert 'function answer() { return 2; }' in final_text,final_text
@@ -170,7 +179,7 @@ try:
  assert state['presentations']==0,'cancelled draft was presented'
  assert (PROJECT/'answer.js').read_text()=='export const answer = 0;\n','cancelled draft was applied'
  assert len(list((PROJECT/'.opencode/jev').glob('runs/*/*.json')))==4,'cancelled draft was evaluated'
- print(json.dumps({'success':True,'opencode':subprocess.check_output(['opencode','--version'],text=True).strip(),'scenarios':['file changes','chat-only code','parent cancellation'],'evaluatedDrafts':4,'privateSessionsReadable':True,'artifacts':str(ROOT)}))
+ print(json.dumps({'success':True,'opencode':subprocess.check_output(['opencode','--version'],text=True).strip(),'scenarios':['read-only tool use','search/replace edits','verbatim result','chat-only code','parent cancellation'],'evaluatedDrafts':4,'privateSessionsReadable':True,'artifacts':str(ROOT)}))
 finally:
  release_worker.set()
  p.terminate()

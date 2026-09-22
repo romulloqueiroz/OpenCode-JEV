@@ -3,8 +3,8 @@ import assert from "node:assert/strict"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { createJevPlugin, type JevHooks, type PluginInput } from "./plugin.ts"
-import type { Harness, HarnessOptions } from "./harness.ts"
+import { createJevPlugin, render, type JevHooks, type PluginInput } from "./plugin.ts"
+import { WORKER_PERMISSION, type Harness, type HarnessOptions } from "./harness.ts"
 
 const roots: string[] = []
 afterEach(async () => { await Promise.all(roots.splice(0).map(p => rm(p, { recursive: true, force: true }))) })
@@ -25,7 +25,8 @@ test("JEV agent is default, inherits selected model, and worker cannot use tools
   assert.equal(cfg.default_agent, "jev")
   assert.equal(cfg.agent.jev.model, undefined)
   assert.deepEqual(cfg.agent.jev.permission, { "*": "deny" })
-  assert.deepEqual(cfg.agent["jev-worker"].permission, { "*": "deny" })
+  assert.deepEqual(cfg.agent["jev-worker"].permission, WORKER_PERMISSION)
+  assert.equal(cfg.agent["jev-worker"].steps, 30)
   assert.equal(cfg.agent["jev-worker"].hidden, true)
   assert.equal((s.hooks as unknown as Record<string, unknown>)["tool.execute.after"], undefined)
 })
@@ -34,14 +35,19 @@ test("pre-generation hook waits for harness and exposes only selected result", a
   let release!: () => void, started!: () => void
   const gate = new Promise<void>(r => { release = r }), begun = new Promise<void>(r => { started = r })
   let calls = 0
-  const s = await setup(async (args: HarnessOptions) => { calls++; assert.deepEqual(args.model, model); started(); await gate; return { answer: "SELECTED_FINAL", changed: ["x.js"] } })
+  const s = await setup(async (args: HarnessOptions) => { calls++; assert.deepEqual(args.model, model); started(); await gate; return { answer: "SELECTED_FINAL", changed: ["x.js"], decision: "rubric_satisfied", rounds: 1, selectedRound: 1 } })
   await s.send()
   let returned = false
   const pending = s.transform().then(result => { returned = true; return result })
   await begun; assert.equal(returned, false)
   release(); const output = await pending
-  assert.match(output.messages[0].parts[0].text, /SELECTED_FINAL/)
+  assert.doesNotMatch(output.messages[0].parts[0].text!, /SELECTED_FINAL/, "The visible model never sees or retells the result")
   assert.equal(output.messages.length, 1)
+  const reply = async (partID: string, messageID = "a1") => { const out = { text: "Done" }; await s.hooks["experimental.text.complete"]({ sessionID: "parent", messageID, partID }, out); return out.text }
+  const shown = await reply("p1")
+  assert.match(shown, /^SELECTED_FINAL/); assert.match(shown, /Changed files:\*\* x\.js/); assert.match(shown, /JEV approved after 1 round/)
+  assert.equal(await reply("p2"), "", "Extra text parts in the same reply are dropped")
+  assert.equal(await reply("p3", "compaction"), "Done", "Later messages are left alone")
   await s.transform(); assert.equal(calls, 1)
   await assert.rejects(s.hooks["tool.execute.before"]({ sessionID: "parent", tool: "write" }), /harness owns/)
 })
@@ -76,9 +82,12 @@ test("cancelling parent or disposing plugin aborts private work", async () => {
 
 test("failure is presented without falling back to unreviewed generation", async () => {
   const s = await setup(async () => { throw new Error("JEV unavailable") })
-  await s.send(); const result = await s.transform()
-  assert.match(result.messages[0].parts[0].text, /JEV unavailable/)
-  assert.match(result.messages[0].parts[0].text, /No unreviewed draft/)
+  await s.send(); await s.transform()
+  const out = { text: "Done" }
+  await s.hooks["experimental.text.complete"]({ sessionID: "parent", messageID: "a1", partID: "p1" }, out)
+  assert.match(out.text, /JEV unavailable/)
+  assert.match(out.text, /No unreviewed draft/)
+  assert.doesNotMatch(out.text, /JEV (?:approved|not approved)/)
 })
 
 test("an aborted older assistant message does not cancel the current user turn", async () => {
@@ -95,4 +104,10 @@ test("disabled plugin changes no agents or messages", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "jev-disabled-")); roots.push(directory)
   await writeFile(path.join(directory, "opencode-jev.json"), '{"enabled":false}')
   assert.deepEqual(await createJevPlugin()({ directory, client }), {})
+})
+
+test("the rendered reply lists unresolved findings when JEV did not approve", () => {
+  const text = render({ answer: "Best effort", changed: [], decision: "revise", rounds: 4, selectedRound: 2, stopReason: "revision budget", unresolved: ["edge-cases"] })
+  assert.match(text, /Unresolved JEV findings:\*\* edge-cases/)
+  assert.match(text, /JEV not approved after 4 round\(s\); showing round 2 \(stopped: revision budget\)/)
 })

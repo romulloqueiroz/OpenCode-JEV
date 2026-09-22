@@ -11,6 +11,7 @@ export interface JevConfig {
   maxSourceBytes: number
   maxStalls: number
   generationTimeout: number
+  maxWorkerSteps: number
   rubricFile?: string
 }
 
@@ -22,6 +23,7 @@ export const DEFAULTS: Readonly<JevConfig> = Object.freeze({
   maxSourceBytes: 200000,
   maxStalls: 2,
   generationTimeout: 300,
+  maxWorkerSteps: 30,
 })
 
 function invalid(message: string): never { throw new TypeError(`Invalid opencode-jev config: ${message}`) }
@@ -36,11 +38,12 @@ export async function loadConfig(directory: string, { readFile = fs.readFile as 
   const config: JevConfig = { ...DEFAULTS, ...raw }
   if (typeof config.enabled !== "boolean") invalid("enabled must be boolean")
   if (typeof config.python !== "string" || !config.python.trim()) invalid("python must be a nonempty string")
-  for (const key of ["maxRevisions", "maxStalls"] as const) {
+  for (const key of ["maxRevisions", "maxStalls", "maxWorkerSteps"] as const) {
     if (!Number.isFinite(config[key]) || !Number.isInteger(config[key])) invalid(`${key} must be an integer`)
   }
   if (config.maxRevisions < 0 || config.maxRevisions > 10) invalid("maxRevisions must be between 0 and 10")
   if (config.maxStalls < 1 || config.maxStalls > 5) invalid("maxStalls must be between 1 and 5")
+  if (config.maxWorkerSteps < 1 || config.maxWorkerSteps > 200) invalid("maxWorkerSteps must be between 1 and 200")
   if (!Number.isFinite(config.timeout) || config.timeout < 1 || config.timeout > 300) invalid("timeout must be between 1 and 300 seconds")
   if (!Number.isFinite(config.generationTimeout) || config.generationTimeout < 1 || config.generationTimeout > 3600) invalid("generationTimeout must be between 1 and 3600 seconds")
   if (!Number.isFinite(config.maxSourceBytes) || config.maxSourceBytes < 1 || config.maxSourceBytes > 2_000_000) invalid("maxSourceBytes must be between 1 and 2000000 bytes")

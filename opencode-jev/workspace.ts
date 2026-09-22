@@ -3,10 +3,18 @@ import path from "node:path"
 import crypto from "node:crypto"
 
 const IGNORED = new Set(["node_modules", "vendor", "venv", "dist", "build", "coverage", "target", "__pycache__"])
-const TEXT = new Set([".py", ".js", ".ts", ".cjs", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".c", ".h", ".cpp", ".cs", ".fs", ".html", ".css", ".scss", ".vue", ".svelte", ".json", ".yaml", ".yml", ".toml", ".xml", ".sql", ".sh", ".md", ".txt", ".dart", ".lua"])
-export interface SourceFile { path: string; content: string; mode: number }
-export interface DraftFile { path: string; content: string | null }
+const TEXT = new Set([".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".c", ".h", ".cpp", ".cs", ".fs", ".html", ".css", ".scss", ".vue", ".svelte", ".json", ".yaml", ".yml", ".toml", ".xml", ".sql", ".sh", ".md", ".txt", ".dart", ".lua"])
+export interface DraftEdit { search: string; replace: string }
+/** Exactly one of content (full text, or null to delete) or edits (search/replace against the original). */
+export interface DraftFile { path: string; content?: string | null; edits?: DraftEdit[] }
 export interface Draft { answer: string; files: DraftFile[] }
+/** A file as it was on disk when the harness first touched it; content null means it did not exist. */
+export interface Original { content: string | null; mode: number }
+/** A materialized change: the complete new content, or null to delete. */
+export interface Change { path: string; content: string | null }
+
+/** A draft the worker can repair: the harness returns this message to it instead of failing the run. */
+export class DraftError extends Error {}
 
 const SECRETS = /(?:^|[._-])(?:env|keys?|secrets?|credentials?|tokens?|passwords?|passwd|private)(?:$|[._-])/i
 export const hash = (value: unknown): string => crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex")
@@ -31,77 +39,133 @@ async function safeTarget(root: string, name: string): Promise<string> {
   return cursor
 }
 
-export async function readWorkspace(directory: string, maxBytes: number, signal?: AbortSignal): Promise<SourceFile[]> {
-  const root = await fs.realpath(directory)
-  const files: SourceFile[] = []
-  let bytes = 0
-  async function visit(folder: string, prefix = ""): Promise<void> {
-    signal?.throwIfAborted()
-    for (const entry of (await fs.readdir(folder, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
-      if (entry.name.startsWith(".") || IGNORED.has(entry.name) || entry.isSymbolicLink()) continue
-      const name = prefix + entry.name
-      if (entry.isDirectory()) { await visit(path.join(folder, entry.name), `${name}/`); continue }
-      if (!entry.isFile() || !sourcePath(name)) continue
-      const target = await safeTarget(root, name)
-      const stat = await fs.stat(target)
-      if (stat.size + bytes > maxBytes) throw new Error(`Project context exceeds maxSourceBytes (${maxBytes}); increase the limit or open a smaller project directory`)
-      const data = await fs.readFile(target)
-      if (data.includes(0)) continue
-      const content = new TextDecoder("utf-8", { fatal: true }).decode(data)
-      bytes += data.length
-      if (bytes > maxBytes) throw new Error(`Project context exceeds maxSourceBytes (${maxBytes})`)
-      files.push({ path: name, content, mode: stat.mode & 0o777 })
-    }
-  }
-  await visit(root)
-  return files.sort((a, b) => a.path.localeCompare(b.path))
+async function readLive(target: string): Promise<string | null> {
+  try { return await fs.readFile(target, "utf8") }
+  catch (error) { if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code!)) return null; throw error }
+}
+
+export async function readOriginal(root: string, name: string): Promise<Original> {
+  const target = await safeTarget(root, name)
+  let data: Buffer, mode: number
+  try { [data, mode] = await Promise.all([fs.readFile(target), fs.stat(target).then(s => s.mode & 0o777)]) }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { content: null, mode: 0o644 }; throw error }
+  if (data.includes(0)) throw new DraftError(`Binary files cannot be edited: ${name}`)
+  try { return { content: new TextDecoder("utf-8", { fatal: true }).decode(data), mode } }
+  catch { throw new DraftError(`File is not valid UTF-8: ${name}`) }
 }
 
 export function validateDraft(value: any, maxBytes: number): Draft {
-  if (!value || typeof value !== "object" || typeof value.answer !== "string" || !Array.isArray(value.files)) throw new Error("Worker returned an invalid draft")
-  if (value.files.length > 128) throw new Error("Worker proposed too many files")
+  if (!value || typeof value !== "object" || typeof value.answer !== "string" || !Array.isArray(value.files)) throw new DraftError("Draft must be a JSON object with a string answer and a files array")
+  if (value.files.length > 128) throw new DraftError("Draft proposes too many files (maximum 128)")
   const paths = new Set<string>()
   let bytes = Buffer.byteLength(value.answer)
   const files: DraftFile[] = value.files.map((file: any): DraftFile => {
-    if (!file || !sourcePath(file.path) || (file.content !== null && typeof file.content !== "string")) throw new Error("Worker proposed an unsupported file or content")
-    if (paths.has(file.path)) throw new Error(`Duplicate proposed file: ${file.path}`)
+    if (!file || !sourcePath(file.path)) throw new DraftError(`Unsupported or unsafe file path: ${file?.path}`)
+    if (paths.has(file.path)) throw new DraftError(`Duplicate proposed file: ${file.path}`)
     paths.add(file.path)
-    if (file.content?.includes("\0")) throw new Error("Binary file changes are not supported")
-    bytes += Buffer.byteLength(file.content || "")
-    return { path: file.path, content: file.content }
+    const hasContent = "content" in file && file.content !== undefined, hasEdits = "edits" in file && file.edits !== undefined
+    if (hasContent === hasEdits) throw new DraftError(`${file.path}: give exactly one of content or edits`)
+    if (hasContent) {
+      if (file.content !== null && typeof file.content !== "string") throw new DraftError(`${file.path}: content must be a string or null`)
+      if (file.content?.includes("\0")) throw new DraftError("Binary file changes are not supported")
+      bytes += Buffer.byteLength(file.content || "")
+      return { path: file.path, content: file.content }
+    }
+    if (!Array.isArray(file.edits) || !file.edits.length) throw new DraftError(`${file.path}: edits must be a nonempty array`)
+    const edits = file.edits.map((edit: any): DraftEdit => {
+      if (!edit || typeof edit.search !== "string" || !edit.search || typeof edit.replace !== "string") throw new DraftError(`${file.path}: each edit needs a nonempty search string and a replace string`)
+      if ((edit.search + edit.replace).includes("\0")) throw new DraftError("Binary file changes are not supported")
+      bytes += Buffer.byteLength(edit.search) + Buffer.byteLength(edit.replace)
+      return { search: edit.search, replace: edit.replace }
+    })
+    return { path: file.path, edits }
   }).sort((a: DraftFile, b: DraftFile) => a.path.localeCompare(b.path))
-  if (!value.answer.trim() && !files.length) throw new Error("Worker returned an empty draft")
-  if (bytes > maxBytes) throw new Error(`Draft exceeds maxSourceBytes (${maxBytes})`)
+  if (!value.answer.trim() && !files.length) throw new DraftError("Draft is empty")
+  if (bytes > maxBytes) throw new DraftError(`Draft exceeds maxSourceBytes (${maxBytes}); use smaller edits`)
   return { answer: value.answer, files }
 }
 
-export function candidateFiles(baseline: SourceFile[], draft: Draft, maxBytes: number): { path: string; content: string }[] {
-  const files = new Map<string, string>(baseline.map(f => [f.path, f.content]))
-  for (const f of draft.files) files.set(f.path, f.content === null ? "[[FILE DELETED IN THIS CANDIDATE]]" : f.content)
-  files.set("[assistant response]", draft.answer)
-  const result = [...files].sort(([a], [b]) => a.localeCompare(b)).map(([path, content]) => ({ path, content }))
-  if (result.reduce((n, f) => n + Buffer.byteLength(f.content), 0) > maxBytes) throw new Error(`Candidate and context exceed maxSourceBytes (${maxBytes})`)
-  return result
+/** Resolve a draft to complete file contents. Records each file's original in `originals` on first use. */
+export async function materialize(directory: string, draft: Draft, originals: Map<string, Original>, signal?: AbortSignal): Promise<Change[]> {
+  const root = await fs.realpath(directory)
+  const changes: Change[] = []
+  for (const file of draft.files) {
+    signal?.throwIfAborted()
+    let original = originals.get(file.path)
+    if (!original) { original = await readOriginal(root, file.path); originals.set(file.path, original) }
+    if (!file.edits) {
+      if (file.content === null && original.content === null) throw new DraftError(`Cannot delete ${file.path}: it does not exist`)
+      changes.push({ path: file.path, content: file.content ?? null })
+      continue
+    }
+    if (original.content === null) throw new DraftError(`${file.path} does not exist; use content for new files`)
+    let text = original.content
+    for (const [index, edit] of file.edits.entries()) {
+      const count = text.split(edit.search).length - 1
+      const label = `${file.path} edit ${index + 1}`
+      if (!count) throw new DraftError(`${label}: search text not found. Copy it exactly from the file, including whitespace:\n${edit.search.slice(0, 200)}`)
+      if (count > 1) throw new DraftError(`${label}: search text matches ${count} places; include more surrounding lines so it is unique`)
+      // A replacer function keeps "$&"-style patterns in the replacement literal.
+      text = text.replace(edit.search, () => edit.replace)
+    }
+    changes.push({ path: file.path, content: text })
+  }
+  return changes
 }
 
-// Compare to the working files, including uncommitted edits. On failure roll
+/** Read project files for evaluator context, skipping unsafe or unreadable ones and stopping at the byte budget. */
+export async function readContext(directory: string, names: Iterable<string>, budget: number): Promise<{ path: string; content: string }[]> {
+  const root = await fs.realpath(directory)
+  const files = []
+  for (const name of [...new Set(names)].filter(sourcePath).sort()) {
+    try {
+      const { content } = await readOriginal(root, name)
+      if (content === null) continue
+      const size = Buffer.byteLength(content)
+      if (size > budget) continue
+      budget -= size
+      files.push({ path: name, content })
+    } catch {}
+  }
+  return files
+}
+
+export function candidateFiles(context: { path: string; content: string }[], changes: Change[], answer: string, maxBytes: number): { path: string; content: string }[] {
+  const files = new Map<string, string>()
+  for (const c of changes) files.set(c.path, c.content === null ? "[[FILE DELETED IN THIS CANDIDATE]]" : c.content)
+  files.set("[assistant response]", answer)
+  let bytes = [...files.values()].reduce((n, content) => n + Buffer.byteLength(content), 0)
+  if (bytes > maxBytes) throw new Error(`Candidate exceeds maxSourceBytes (${maxBytes})`)
+  for (const f of context) {
+    const size = Buffer.byteLength(f.content)
+    if (files.has(f.path) || bytes + size > maxBytes) continue
+    files.set(f.path, f.content); bytes += size
+  }
+  return [...files].sort(([a], [b]) => a.localeCompare(b)).map(([path, content]) => ({ path, content }))
+}
+
+// Compare to the files as first read, including uncommitted edits. On failure roll
 // back only our own writes; never overwrite a subsequent edit by another writer.
-export async function applyDraft(directory: string, baseline: SourceFile[], draft: Draft, maxBytes: number, signal?: AbortSignal): Promise<string[]> {
+export async function applyDraft(directory: string, originals: Map<string, Original>, draft: Change[], signal?: AbortSignal): Promise<string[]> {
   signal?.throwIfAborted()
   const root = await fs.realpath(directory)
-  if (hash(await readWorkspace(root, maxBytes, signal)) !== hash(baseline)) throw new Error("Project changed during refinement; no draft applied. The selected result is in the run report.")
-  const original = new Map(baseline.map(f => [f.path, f]))
-  const changes = draft.files.filter(f => (original.get(f.path)?.content ?? null) !== f.content)
-  const written: DraftFile[] = [], createdDirs: string[] = []
+  const original = (name: string) => {
+    const value = originals.get(name)
+    if (!value) throw new Error(`No original recorded for ${name}`)
+    return value
+  }
+  const changes = draft.filter(f => original(f.path).content !== f.content)
+  for (const file of changes) {
+    if (await readLive(await safeTarget(root, file.path)) !== original(file.path).content) throw new Error(`Project changed during refinement (${file.path}); no draft applied. The selected result is in the run report.`)
+  }
+  const written: Change[] = [], createdDirs: string[] = []
   async function replace(target: string, content: string, previous: string | null, mode: number): Promise<void> {
     const staging = path.join(path.dirname(target), `.jev-${crypto.randomUUID()}.tmp`)
     try {
       // A failed or interrupted write must not truncate an existing user file.
       await fs.writeFile(staging, content, { flag: "wx", mode })
       signal?.throwIfAborted()
-      let live: string | null = null
-      try { live = await fs.readFile(target, "utf8") } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error }
-      if (live !== previous) throw new Error(`File changed before publication: ${target}`)
+      if (await readLive(target) !== previous) throw new Error(`File changed before publication: ${target}`)
       if (previous === null) await fs.link(staging, target)
       else await fs.rename(staging, target)
     } finally { await fs.unlink(staging).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error }) }
@@ -110,14 +174,13 @@ export async function applyDraft(directory: string, baseline: SourceFile[], draf
     for (const file of changes) {
       signal?.throwIfAborted()
       const target = await safeTarget(root, file.path)
-      let live: string | null = null
-      try { live = await fs.readFile(target, "utf8") } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error }
-      if (live !== (original.get(file.path)?.content ?? null)) throw new Error(`File changed before publication: ${file.path}`)
+      const old = original(file.path)
+      if (await readLive(target) !== old.content) throw new Error(`File changed before publication: ${file.path}`)
       if (file.content === null) await fs.unlink(target)
       else {
         const firstCreated = await fs.mkdir(path.dirname(target), { recursive: true })
         if (firstCreated) createdDirs.push(firstCreated)
-        await replace(target, file.content, live, original.get(file.path)?.mode ?? 0o644)
+        await replace(target, file.content, old.content, old.mode)
       }
       written.push(file)
     }
@@ -125,11 +188,11 @@ export async function applyDraft(directory: string, baseline: SourceFile[], draf
   } catch (error) {
     for (const file of written.reverse()) {
       const target = await safeTarget(root, file.path)
-      let live: string | null = null
-      try { live = await fs.readFile(target, "utf8") } catch (readError) { if ((readError as NodeJS.ErrnoException).code !== "ENOENT") continue }
+      let live: string | null
+      try { live = await readLive(target) } catch { continue }
       if (live !== file.content) continue
-      const old = original.get(file.path)
-      if (old) await fs.writeFile(target, old.content, { mode: old.mode })
+      const old = original(file.path)
+      if (old.content !== null) await fs.writeFile(target, old.content, { mode: old.mode })
       else await fs.unlink(target)
     }
     for (const folder of createdDirs.reverse()) { try { await fs.rmdir(folder) } catch {} }

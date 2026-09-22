@@ -14,6 +14,8 @@ test("config defaults and validation bounds", async t => {
   await assert.rejects(loadConfig(root), /maxRevisions/)
   await writeFile(path.join(root, "opencode-jev.json"), JSON.stringify({ timeout: 0 }))
   await assert.rejects(loadConfig(root), /timeout/)
+  await writeFile(path.join(root, "opencode-jev.json"), JSON.stringify({ maxWorkerSteps: 0 }))
+  await assert.rejects(loadConfig(root), /maxWorkerSteps/)
   await writeFile(path.join(root, "opencode-jev.json"), JSON.stringify({ enabled: "yes" }))
   await assert.rejects(loadConfig(root), /enabled/)
 })
