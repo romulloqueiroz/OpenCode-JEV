@@ -1,20 +1,59 @@
 import { promises as fs } from "node:fs"
-import { loadConfig } from "./io.mjs"
-import { createHarness } from "./harness.mjs"
+import { loadConfig } from "./io.ts"
+import { createHarness, type Harness, type HarnessClient, type HarnessDeps, type HarnessResult, type ModelRef } from "./harness.ts"
 
-const textOf = parts => (parts || []).filter(p => p.type === "text" && !p.ignored).map(p => p.text || "").join("\n")
+// Local shapes for the OpenCode 1.18.32 hooks this plugin uses. The published
+// SDK types lag the runtime (wildcard permissions, default_agent, variant).
+interface Part { type: string; text?: string; ignored?: boolean; [key: string]: unknown }
+interface MessageInfo { role: string; id: string; sessionID: string; agent?: string; model?: ModelRef; variant?: string; [key: string]: unknown }
+interface ChatMessage { info: MessageInfo; parts: Part[] }
+interface AgentConfig { description: string; mode: string; hidden?: boolean; steps?: number; permission: Record<string, string>; prompt: string; model?: string }
+interface OpencodeConfig { agent?: Record<string, AgentConfig>; default_agent?: string; [key: string]: unknown }
+interface OpencodeEvent { type: string; properties?: { sessionID?: string; info?: { id?: string; sessionID?: string; role?: string; error?: unknown; parentID?: string } } }
+
+export interface PluginInput {
+  directory: string
+  client: HarnessClient & { tui?: { showToast?(request: { body: { title: string; message: string; variant: string } }): Promise<unknown> } }
+}
+
+export interface JevHooks {
+  config: (cfg: OpencodeConfig) => Promise<void>
+  "chat.message": (hook: { sessionID: string; agent?: string; model?: ModelRef; variant?: string }, output: { message?: Partial<MessageInfo>; parts?: Part[] }) => Promise<void>
+  "experimental.chat.messages.transform": (hook: unknown, output: { messages: ChatMessage[] }) => Promise<void>
+  "tool.execute.before": (hook: { sessionID: string; tool: string }) => Promise<void>
+  event: (input: { event: OpencodeEvent }) => Promise<void>
+  dispose: () => Promise<void>
+}
+
+interface Turn {
+  id: string
+  messageID?: string
+  model?: ModelRef
+  variant?: string
+  controller: AbortController
+  cancelled: boolean
+  result: HarnessResult | null
+  running: Promise<HarnessResult> | null
+}
+
+export interface PluginOverrides extends Partial<HarnessDeps> {
+  loadConfig?: typeof loadConfig
+  harness?: Harness
+}
+
+const textOf = (parts: Part[] | undefined) => (parts || []).filter(p => p.type === "text" && !p.ignored).map(p => p.text || "").join("\n")
 
 /** Run refinement BEFORE the visible agent makes its first model request. */
-export function createJevPlugin(overrides = {}) {
-  return async function JevPlugin(input) {
+export function createJevPlugin(overrides: PluginOverrides = {}) {
+  return async function JevPlugin(input: PluginInput): Promise<JevHooks | Record<string, never>> {
     const directory = await fs.realpath(input.directory)
     const config = await (overrides.loadConfig || loadConfig)(directory)
     if (!config.enabled) return {}
     const harness = overrides.harness || createHarness(overrides)
-    const turns = new Map()
+    const turns = new Map<string | undefined, Turn>()
     let disposed = false
-    function cancel(turn) { turn?.controller.abort(); if (turn) turn.cancelled = true }
-    async function progress(message) {
+    function cancel(turn: Turn | undefined) { turn?.controller.abort(); if (turn) turn.cancelled = true }
+    async function progress(message: string) {
       try { await input.client.tui?.showToast?.({ body: { title: "JEV", message, variant: "info" } }) } catch {}
     }
     return {
@@ -67,7 +106,7 @@ export function createJevPlugin(overrides = {}) {
         try { result = await turn.running }
         catch (error) {
           if (turn.cancelled || disposed) throw error
-          result = { answer: `JEV harness failed: ${error.message}. No unreviewed draft was published.`, changed: [], decision: "failed" }
+          result = { answer: `JEV harness failed: ${(error as Error).message}. No unreviewed draft was published.`, changed: [], decision: "failed" }
         }
         if (turns.get(id) !== turn || turn.cancelled || disposed) throw new Error("JEV refinement superseded")
         const text = `JEV HARNESS FINAL RESULT\nThe private drafting and evaluation loop is finished. Present the selected answer below. Do not implement or draft anything else.\n\n${JSON.stringify(result)}\n\nCopy any requested code from answer unchanged. State changed files and any remaining unresolved findings. A rubric judgment is not a test result.`

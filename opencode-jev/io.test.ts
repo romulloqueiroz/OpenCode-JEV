@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 import { mkdtemp, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { loadConfig, runBridge } from "./io.mjs"
+import { loadConfig, runBridge } from "./io.ts"
 
 async function tempDir() { return mkdtemp(path.join(tmpdir(), "jev-io-")) }
 

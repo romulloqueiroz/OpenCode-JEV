@@ -3,36 +3,38 @@ import assert from "node:assert/strict"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { createJevPlugin } from "./plugin.mjs"
+import { createJevPlugin, type JevHooks, type PluginInput } from "./plugin.ts"
+import type { Harness, HarnessOptions } from "./harness.ts"
 
-const roots = []
+const roots: string[] = []
 afterEach(async () => { await Promise.all(roots.splice(0).map(p => rm(p, { recursive: true, force: true }))) })
 const model = { providerID: "mock", modelID: "selected" }
 const message = (agent = "jev", id = "u1", text = "Implement X") => ({ info: { role: "user", agent, id, sessionID: "parent", model }, parts: [{ type: "text", text }] })
-async function setup(harness) {
+const client = {} as PluginInput["client"]
+async function setup(harness: (args: HarnessOptions) => Promise<any>) {
   const directory = await mkdtemp(path.join(tmpdir(), "jev-hooks-")); roots.push(directory)
-  const hooks = await createJevPlugin({ harness })({ directory, client: {} })
+  const hooks = await createJevPlugin({ harness: harness as Harness })({ directory, client }) as JevHooks
   const send = async (msg = message()) => hooks["chat.message"]({ sessionID: msg.info.sessionID, agent: msg.info.agent, model }, { message: msg.info, parts: msg.parts })
   const transform = async (msg = message()) => { const output = { messages: [msg] }; await hooks["experimental.chat.messages.transform"]({}, output); return output }
   return { hooks, directory, send, transform }
 }
 
 test("JEV agent is default, inherits selected model, and worker cannot use tools", async () => {
-  const s = await setup(async () => ({})); const cfg = {}
+  const s = await setup(async () => ({})); const cfg: any = {}
   await s.hooks.config(cfg)
   assert.equal(cfg.default_agent, "jev")
   assert.equal(cfg.agent.jev.model, undefined)
   assert.deepEqual(cfg.agent.jev.permission, { "*": "deny" })
   assert.deepEqual(cfg.agent["jev-worker"].permission, { "*": "deny" })
   assert.equal(cfg.agent["jev-worker"].hidden, true)
-  assert.equal(s.hooks["tool.execute.after"], undefined)
+  assert.equal((s.hooks as unknown as Record<string, unknown>)["tool.execute.after"], undefined)
 })
 
 test("pre-generation hook waits for harness and exposes only selected result", async () => {
-  let release, started
-  const gate = new Promise(r => { release = r }), begun = new Promise(r => { started = r })
+  let release!: () => void, started!: () => void
+  const gate = new Promise<void>(r => { release = r }), begun = new Promise<void>(r => { started = r })
   let calls = 0
-  const s = await setup(async args => { calls++; assert.deepEqual(args.model, model); started(); await gate; return { answer: "SELECTED_FINAL", changed: ["x.js"] } })
+  const s = await setup(async (args: HarnessOptions) => { calls++; assert.deepEqual(args.model, model); started(); await gate; return { answer: "SELECTED_FINAL", changed: ["x.js"] } })
   await s.send()
   let returned = false
   const pending = s.transform().then(result => { returned = true; return result })
@@ -51,9 +53,9 @@ test("worker and ordinary non-JEV agents never recursively invoke harness", asyn
 })
 
 test("new user message aborts old run; old result cannot reach visible model", async () => {
-  let release, started, signal
-  const gate = new Promise(r => { release = r }), begun = new Promise(r => { started = r })
-  const s = await setup(async args => { signal = args.signal; started(); await gate; return { answer: "stale" } })
+  let release!: () => void, started!: () => void, signal!: AbortSignal
+  const gate = new Promise<void>(r => { release = r }), begun = new Promise<void>(r => { started = r })
+  const s = await setup(async (args: HarnessOptions) => { signal = args.signal!; started(); await gate; return { answer: "stale" } })
   await s.send(); const pending = s.transform(); await begun
   await s.send(message("jev", "u2", "Different task"))
   assert.equal(signal.aborted, true)
@@ -62,9 +64,9 @@ test("new user message aborts old run; old result cannot reach visible model", a
 
 test("cancelling parent or disposing plugin aborts private work", async () => {
   for (const dispose of [false, true]) {
-    let release, started, signal
-    const gate = new Promise(r => { release = r }), begun = new Promise(r => { started = r })
-    const s = await setup(async args => { signal = args.signal; started(); await gate; signal.throwIfAborted() })
+    let release!: () => void, started!: () => void, signal!: AbortSignal
+    const gate = new Promise<void>(r => { release = r }), begun = new Promise<void>(r => { started = r })
+    const s = await setup(async (args: HarnessOptions) => { signal = args.signal!; started(); await gate; signal.throwIfAborted() })
     await s.send(); const pending = s.transform(); await begun
     if (dispose) await s.hooks.dispose()
     else await s.hooks.event({ event: { type: "message.updated", properties: { info: { role: "assistant", sessionID: "parent", error: { name: "MessageAbortedError" } } } } })
@@ -80,8 +82,8 @@ test("failure is presented without falling back to unreviewed generation", async
 })
 
 test("an aborted older assistant message does not cancel the current user turn", async () => {
-  let signal
-  const s = await setup(async args => { signal = args.signal; return { answer: "current" } })
+  let signal!: AbortSignal
+  const s = await setup(async (args: HarnessOptions) => { signal = args.signal!; return { answer: "current" } })
   await s.send(message("jev", "u2")); await s.transform(message("jev", "u2"))
   await s.hooks.event({ event: { type: "message.updated", properties: { info: {
     role: "assistant", sessionID: "parent", parentID: "u1", error: { name: "MessageAbortedError" },
@@ -92,5 +94,5 @@ test("an aborted older assistant message does not cancel the current user turn",
 test("disabled plugin changes no agents or messages", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "jev-disabled-")); roots.push(directory)
   await writeFile(path.join(directory, "opencode-jev.json"), '{"enabled":false}')
-  assert.deepEqual(await createJevPlugin()({ directory, client: {} }), {})
+  assert.deepEqual(await createJevPlugin()({ directory, client }), {})
 })

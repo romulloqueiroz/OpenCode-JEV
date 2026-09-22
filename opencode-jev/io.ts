@@ -3,7 +3,18 @@ import path from "node:path"
 import { spawn as nodeSpawn } from "node:child_process"
 import { fileURLToPath } from "node:url"
 
-export const DEFAULTS = Object.freeze({
+export interface JevConfig {
+  enabled: boolean
+  python: string
+  maxRevisions: number
+  timeout: number
+  maxSourceBytes: number
+  maxStalls: number
+  generationTimeout: number
+  rubricFile?: string
+}
+
+export const DEFAULTS: Readonly<JevConfig> = Object.freeze({
   enabled: true,
   python: "python3",
   maxRevisions: 3,
@@ -13,17 +24,19 @@ export const DEFAULTS = Object.freeze({
   generationTimeout: 300,
 })
 
-function invalid(message) { throw new TypeError(`Invalid opencode-jev config: ${message}`) }
+function invalid(message: string): never { throw new TypeError(`Invalid opencode-jev config: ${message}`) }
 
-export async function loadConfig(directory, { readFile = fs.readFile } = {}) {
-  let raw
+type ReadFile = (file: string, encoding: "utf8") => Promise<string>
+
+export async function loadConfig(directory: string, { readFile = fs.readFile as ReadFile }: { readFile?: ReadFile } = {}): Promise<JevConfig> {
+  let raw: unknown
   try { raw = JSON.parse(await readFile(path.join(directory, "opencode-jev.json"), "utf8")) }
-  catch (error) { if (error?.code === "ENOENT") return { ...DEFAULTS }; throw error }
+  catch (error) { if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return { ...DEFAULTS }; throw error }
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) invalid("configuration must be an object")
-  const config = { ...DEFAULTS, ...raw }
+  const config: JevConfig = { ...DEFAULTS, ...raw }
   if (typeof config.enabled !== "boolean") invalid("enabled must be boolean")
   if (typeof config.python !== "string" || !config.python.trim()) invalid("python must be a nonempty string")
-  for (const key of ["maxRevisions", "maxStalls"]) {
+  for (const key of ["maxRevisions", "maxStalls"] as const) {
     if (!Number.isFinite(config[key]) || !Number.isInteger(config[key])) invalid(`${key} must be an integer`)
   }
   if (config.maxRevisions < 0 || config.maxRevisions > 10) invalid("maxRevisions must be between 0 and 10")
@@ -35,14 +48,23 @@ export async function loadConfig(directory, { readFile = fs.readFile } = {}) {
   return config
 }
 
-export function runBridge({ python = DEFAULTS.python, directory, payload, timeout = DEFAULTS.timeout, signal, spawn = nodeSpawn } = {}) {
+export interface BridgeOptions {
+  python?: string
+  directory?: string
+  payload?: unknown
+  timeout?: number
+  signal?: AbortSignal
+  spawn?: typeof nodeSpawn
+}
+
+export function runBridge({ python = DEFAULTS.python, directory, payload, timeout = DEFAULTS.timeout, signal, spawn = nodeSpawn }: BridgeOptions = {}): Promise<any> {
   const bridge = fileURLToPath(new URL("../opencode_jev_bridge.py", import.meta.url))
   return new Promise((resolve, reject) => {
-    let settled = false; let timer; let killTimer; let stdout = ""; let stderr = ""
-    let onAbort
+    let settled = false; let timer: NodeJS.Timeout | undefined; let killTimer: NodeJS.Timeout | undefined; let stdout = ""; let stderr = ""
+    let onAbort: (() => void) | undefined
     const child = spawn(python, [bridge], { cwd: directory, shell: false, stdio: ["pipe", "pipe", "pipe"] })
-    const finish = (error, value) => { if (settled) return; settled = true; clearTimeout(timer); clearTimeout(killTimer); if (signal && onAbort) signal.removeEventListener("abort", onAbort); if (error) reject(error); else resolve(value) }
-    const stop = reason => {
+    const finish = (error: Error | null, value?: unknown) => { if (settled) return; settled = true; clearTimeout(timer); clearTimeout(killTimer); if (signal && onAbort) signal.removeEventListener("abort", onAbort); if (error) reject(error); else resolve(value) }
+    const stop = (reason: unknown) => {
       if (settled) return
       settled = true; clearTimeout(timer)
       if (signal && onAbort) signal.removeEventListener("abort", onAbort)
@@ -52,12 +74,12 @@ export function runBridge({ python = DEFAULTS.python, directory, payload, timeou
     child.once("error", error => finish(error))
     child.stdout.on("data", chunk => { if (settled) return; stdout += chunk; if (Buffer.byteLength(stdout) > 16 * 1024 * 1024) stop(new Error("JEV bridge stdout exceeded 16MB")) })
     child.stderr.on("data", chunk => { if (settled) return; stderr += chunk; if (Buffer.byteLength(stderr) > 16 * 1024 * 1024) stop(new Error("JEV bridge stderr exceeded 16MB")) })
-    child.stdin.once("error", error => { if (error.code !== "EPIPE") stop(error) })
+    child.stdin.once("error", (error: NodeJS.ErrnoException) => { if (error.code !== "EPIPE") stop(error) })
     child.once("close", code => {
       clearTimeout(killTimer)
       if (settled) return
       if (code !== 0) return finish(new Error(stderr.trim() || `JEV bridge exited with code ${code}`))
-      try { finish(null, JSON.parse(stdout)) } catch (error) { finish(new Error(`Invalid JEV bridge JSON: ${error.message}`)) }
+      try { finish(null, JSON.parse(stdout)) } catch (error) { finish(new Error(`Invalid JEV bridge JSON: ${(error as Error).message}`)) }
     })
     timer = setTimeout(() => stop(new Error(`JEV bridge timed out after ${timeout} seconds`)), timeout * 1000)
     if (signal) {

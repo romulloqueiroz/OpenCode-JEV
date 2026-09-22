@@ -10,7 +10,7 @@ opencode.jsonc
 .opencode/*
 !.opencode/plugins/
 .opencode/plugins/*
-!.opencode/plugins/jev.js
+!.opencode/plugins/jev.ts
 
 # Build, test, and editor artifacts
 node_modules/

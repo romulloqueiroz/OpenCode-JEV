@@ -16,7 +16,8 @@ Both proposed file edits and code snippets returned in chat are evaluated.
 ## Quick start
 
 Requirements: OpenCode, Python 3.10+, and a Typesafe API key for JEV. Tests require
-Node.js 20.3+. There are no extra runtime dependencies. Tested with OpenCode
+Node.js 22.18+ (it runs the TypeScript sources directly). There are no runtime
+dependencies; OpenCode loads the TypeScript plugin without a build step. Tested with OpenCode
 1.18.32; experimental hooks may change in later versions.
 
 Clone this repository, then add its absolute entry-point path to your coding
@@ -25,7 +26,7 @@ project's `opencode.json`. Merge with any existing plugin list:
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["file:///absolute/path/to/opencode-jev/index.mjs"]
+  "plugin": ["file:///absolute/path/to/opencode-jev/index.ts"]
 }
 ```
 
@@ -41,8 +42,8 @@ uses its separately pinned judge model. Build and Plan remain available, but
 their turns do not use this harness. Set `enabled: false` in the configuration
 below and restart OpenCode to disable it.
 
-Keep the clone in place: JavaScript modules and the Python bridge load relative
-to its entry point. Inside this repository, `.opencode/plugins/jev.js` loads the
+Keep the clone in place: TypeScript modules and the Python bridge load relative
+to its entry point. Inside this repository, `.opencode/plugins/jev.ts` loads the
 plugin automatically; do not also add it to a plugin list.
 
 ## How it works
@@ -81,7 +82,7 @@ presentation is another call to the selected model, instructed to reproduce
 selected code unchanged. The controller applies evaluated file contents
 directly; chat presentation is still model-generated.
 
-Eligible text files are defined in `opencode-jev/workspace.mjs`. Hidden paths,
+Eligible text files are defined in `opencode-jev/workspace.ts`. Hidden paths,
 symlinks, common secret filenames, lockfiles, OpenCode configuration, and common
 dependency/build directories are excluded. Binary changes are unsupported. This
 filter does not implement `.gitignore` or scan file contents for secrets.
@@ -156,11 +157,11 @@ These tests verify control flow, not real-model quality gains or rubric calibrat
 
 ## Implementation
 
-- `index.mjs`: public OpenCode plugin entry point.
-- `opencode-jev/plugin.mjs`: agent configuration and pre-generation interception.
-- `opencode-jev/harness.mjs`: private generation, evaluation, and selection loop.
-- `opencode-jev/workspace.mjs`: context snapshots and selected file publication.
-- `opencode-jev/io.mjs`: configuration and cancellable evaluator subprocess.
+- `index.ts`: public OpenCode plugin entry point.
+- `opencode-jev/plugin.ts`: agent configuration and pre-generation interception.
+- `opencode-jev/harness.ts`: private generation, evaluation, and selection loop.
+- `opencode-jev/workspace.ts`: context snapshots and selected file publication.
+- `opencode-jev/io.ts`: configuration and cancellable evaluator subprocess.
 - `opencode_jev_bridge.py`: JSON adapter to the existing evaluator.
 - `jev_evaluate.py`: judge request, validation, rubrics, and comparison logic.
 
@@ -170,7 +171,7 @@ References: [OpenCode plugins](https://opencode.ai/docs/plugins/),
 
 ## Contributing
 
-Run `npm test` before submitting changes. Keep ordinary tests independent of
+Run `npm install`, `npm run typecheck`, and `npm test` before submitting changes. Keep ordinary tests independent of
 credentials and paid services. Include regression coverage for changes to
 cancellation, publication, stopping rules, or evaluation comparisons.
 

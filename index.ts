@@ -1,3 +1,3 @@
-import { createJevPlugin } from "./opencode-jev/plugin.mjs"
+import { createJevPlugin } from "./opencode-jev/plugin.ts"
 
 export default createJevPlugin()

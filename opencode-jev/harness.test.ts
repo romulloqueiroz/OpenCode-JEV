@@ -3,31 +3,32 @@ import assert from "node:assert/strict"
 import { mkdtemp, rm, writeFile, readFile, mkdir, symlink, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { createHarness, decodeDraft } from "./harness.mjs"
-import { readWorkspace, applyDraft, validateDraft, candidateFiles } from "./workspace.mjs"
+import { createHarness, decodeDraft, type HarnessDeps, type HarnessOptions, type JevReport } from "./harness.ts"
+import { DEFAULTS } from "./io.ts"
+import { readWorkspace, applyDraft, validateDraft, candidateFiles, type Draft } from "./workspace.ts"
 
-const roots = []
+const roots: string[] = []
 afterEach(async () => { await Promise.all(roots.splice(0).map(p => rm(p, { recursive: true, force: true }))) })
 async function temp() { const dir = await mkdtemp(path.join(tmpdir(), "jev-private-")); roots.push(dir); return dir }
-const config = { maxRevisions: 3, maxStalls: 2, maxSourceBytes: 100000, timeout: 30 }
+const config = { ...DEFAULTS, maxRevisions: 3, maxStalls: 2, maxSourceBytes: 100000, timeout: 30 }
 const model = { providerID: "mock", modelID: "chosen-model" }
-const draft = (value, files = true) => ({ answer: `ANSWER_${value}`, files: files ? [{ path: "x.js", content: `export const x = ${value};` }] : [] })
-const report = (decision, recommendation) => ({ decision, unresolved_ids: decision === "revise" ? ["behavior"] : [],
+const draft = (value: number, files = true): Draft => ({ answer: `ANSWER_${value}`, files: files ? [{ path: "x.js", content: `export const x = ${value};` }] : [] })
+const report = (decision: JevReport["decision"], recommendation?: string): JevReport => ({ decision, unresolved_ids: decision === "revise" ? ["behavior"] : [],
   ...(recommendation ? { previous_comparison: { recommendation, gaps: [], possible_essential_regressions: [] } } : {}) })
-async function setup(drafts, reports, overrides = {}) {
+async function setup(drafts: Draft[], reports: JevReport[], overrides: Partial<HarnessDeps> = {}) {
   const directory = await temp(); await writeFile(path.join(directory, "x.js"), "original")
-  const prompts = [], creates = [], evaluations = [], records = [], aborts = []
+  const prompts: any[] = [], creates: any[] = [], evaluations: any[] = [], records: any[] = [], aborts: any[] = []
   const client = { session: {
-    async create(request) { creates.push(request); return { data: { id: "child" } } },
-    async prompt(request) { prompts.push(request); return { data: { info: {}, parts: [{ type: "text", text: JSON.stringify(drafts.shift()) }] } } },
-    async abort(request) { aborts.push(request); return {} },
+    async create(request: any) { creates.push(request); return { data: { id: "child" } } },
+    async prompt(request: any): Promise<any> { prompts.push(request); return { data: { info: {}, parts: [{ type: "text", text: JSON.stringify(drafts.shift()) }] } } },
+    async abort(request: any) { aborts.push(request); return {} },
   } }
   const run = createHarness({ evaluate: async payload => {
     assert.equal(await readFile(path.join(directory, "x.js"), "utf8"), "original", "No draft may touch live files before selection")
     evaluations.push(payload); return { report: reports.shift(), feedback: "Fix behavior; preserve interface" }
   }, saveRound: async (_d, _r, _n, record) => { records.push(record); return "audit.json" }, ...overrides })
   return { directory, prompts, creates, evaluations, records, aborts, client,
-    run: options => run({ client, directory, sessionID: "parent", model, task: "Set x to 2", config, ...options }) }
+    run: (options: Partial<HarnessOptions> = {}) => run({ client, directory, sessionID: "parent", model, task: "Set x to 2", config, ...options }) }
 }
 
 test("draft/evaluate/revise finishes privately and applies only the selected candidate", async () => {
@@ -46,13 +47,13 @@ test("chat-only generated code is evaluated and returned without file writes", a
   const s = await setup([draft(1, false), draft(2, false)], [report("revise"), report("rubric_satisfied", "improved_by_jev")])
   const result = await s.run()
   assert.equal(result.answer, "ANSWER_2"); assert.deepEqual(result.changed, [])
-  assert.ok(s.evaluations[0].files.some(f => f.path === "[assistant response]" && f.content === "ANSWER_1"))
+  assert.ok(s.evaluations[0].files.some((f: { path: string; content: string }) => f.path === "[assistant response]" && f.content === "ANSWER_1"))
   assert.equal(await readFile(path.join(s.directory, "x.js"), "utf8"), "original")
 })
 
 test("a regressing final attempt never replaces the better evaluated draft", async () => {
   const worse = report("revise", "hold_possible_regression")
-  worse.previous_comparison.possible_essential_regressions = ["behavior"]
+  worse.previous_comparison!.possible_essential_regressions = ["behavior"]
   const s = await setup([draft(1), draft(0)], [report("revise"), worse])
   const result = await s.run({ config: { ...config, maxRevisions: 1 } })
   assert.equal(result.answer, "ANSWER_1"); assert.equal(result.selectedRound, 1)
@@ -94,7 +95,7 @@ test("concurrent user edits invalidate publication", async () => {
 
 test("worker deadline aborts private generation and does not publish", async () => {
   const s = await setup([], [])
-  s.client.session.prompt = request => new Promise((_resolve, reject) => {
+  s.client.session.prompt = (request: any) => new Promise((_resolve, reject) => {
     request.signal.addEventListener("abort", () => reject(request.signal.reason), { once: true })
   })
   // Keep the event loop alive: AbortSignal.timeout intentionally unrefs its timer.
