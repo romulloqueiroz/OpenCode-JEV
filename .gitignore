@@ -1,0 +1,28 @@
+# Credentials and local overrides
+.env
+.env.*
+!.env.example
+opencode-jev.json
+opencode.json
+opencode.jsonc
+
+# Generated OpenCode dependencies and evaluation records
+.opencode/*
+!.opencode/plugins/
+.opencode/plugins/*
+!.opencode/plugins/jev.js
+
+# Build, test, and editor artifacts
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+coverage/
+dist/
+*.tgz
+.DS_Store
+.idea/
+.vscode/

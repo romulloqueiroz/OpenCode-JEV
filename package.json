@@ -1,0 +1,27 @@
+{
+  "name": "opencode-jev",
+  "version": "0.2.0",
+  "description": "Automatic JEV evaluation and code refinement for OpenCode",
+  "type": "module",
+  "license": "MIT",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "opencode-jev/plugin.mjs",
+    "opencode-jev/io.mjs",
+    "opencode-jev/harness.mjs",
+    "opencode-jev/workspace.mjs",
+    "jev_evaluate.py",
+    "opencode_jev_bridge.py",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.3"
+  },
+  "scripts": {
+    "test": "python3 -B -m unittest test_jev_evaluate test_opencode_jev_bridge && node --test opencode-jev/*.test.mjs",
+    "test:smoke": "python3 -B opencode-jev/smoke.py"
+  },
+  "keywords": ["opencode", "opencode-plugin", "jev", "evaluator-optimizer"]
+}
