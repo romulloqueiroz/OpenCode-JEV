@@ -28,7 +28,7 @@ async function setup(drafts: unknown[], reports: JevReport[], overrides: Partial
   const run = createHarness({ evaluate: async payload => {
     assert.equal(await readFile(path.join(directory, "x.js"), "utf8"), "original", "No draft may touch live files before selection")
     evaluations.push(payload); return { report: reports.shift(), feedback: "Fix behavior; preserve interface" }
-  }, saveRound: async (_d, _r, _n, record) => { records.push(record); return "audit.json" }, ...overrides })
+  }, route: async () => 0.9, saveRound: async (_d, _r, _n, record) => { records.push(record); return "audit.json" }, ...overrides })
   return { directory, prompts, creates, evaluations, records, aborts, client, reads,
     run: (options: Partial<HarnessOptions> = {}) => run({ client, directory, sessionID: "parent", model, task: "Set x to 2", config, ...options }) }
 }
@@ -82,6 +82,31 @@ test("an unusable draft goes back to the worker without spending a JEV round", a
   const hopeless = await setup([broken, broken, broken], [])
   await assert.rejects(hopeless.run(), /search text not found/)
   assert.equal(hopeless.evaluations.length, 0)
+})
+
+test("conversation skips the drafting loop: one direct answer, no grading, no file changes", async () => {
+  const routed: any[] = []
+  const s = await setup(["Because loops catch mistakes."], [], { route: async payload => { routed.push(payload); return 0.2 } })
+  const result = await s.run({ task: "user:\nhi\n\nuser:\nWhy use loops?", request: "Why use loops?" })
+  assert.deepEqual(result, { answer: "Because loops catch mistakes.", changed: [], decision: "chat", childID: "child" })
+  assert.deepEqual(routed, [{ latest: "Why use loops?", conversation: "user:\nhi\n\nuser:\nWhy use loops?" }])
+  assert.equal(s.evaluations.length, 0); assert.equal(s.prompts.length, 1)
+  assert.match(s.prompts[0].body.parts[0].text, /plain Markdown \(not JSON\)/)
+  assert.equal(s.creates[0].body.title, "JEV direct answer")
+  assert.deepEqual(s.creates[0].body.permission, workerRuleset(), "Direct answers stay read-only")
+  assert.equal(await readFile(path.join(s.directory, "x.js"), "utf8"), "original")
+})
+
+test("routing threshold: at or above it runs the loop; 0 disables routing; failures are not skipped", async () => {
+  const edge = await setup([draft(2)], [report("rubric_satisfied")], { route: async () => 0.5 })
+  assert.equal((await edge.run()).decision, "rubric_satisfied")
+  let asked = false
+  const off = await setup([draft(2)], [report("rubric_satisfied")], { route: async () => { asked = true; return 0 } })
+  assert.equal((await off.run({ config: { ...config, codeThreshold: 0 } })).decision, "rubric_satisfied")
+  assert.equal(asked, false)
+  const down = await setup([draft(2)], [], { route: async () => { throw new Error("JEV offline") } })
+  await assert.rejects(down.run(), /JEV offline/)
+  assert.equal(down.prompts.length, 0, "A routing failure never falls back to an ungraded answer")
 })
 
 test("chat-only generated code is evaluated and returned without file writes", async () => {

@@ -84,6 +84,26 @@ class BridgeTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     bridge.validate_request(case)
 
+    def test_route_asks_one_yes_no_question_about_the_latest_message(self):
+        sent = {}
+        def fake_ask(payload, api_key, timeout):
+            sent.update(payload)
+            return {"model": jev.DEFAULT_MODEL, "answers": {"needs_code": {"type": "noul", "noul": 0.12}}}
+        with patch.object(jev, "ask_jev", fake_ask), patch.object(jev, "api_key_from_env", lambda: "key"):
+            result = bridge.handle({"mode": "route", "latest": "Why is the sky blue?", "conversation": "user:\nhi", "timeout": 5})
+        self.assertEqual(result, {"needs_code": 0.12})
+        self.assertEqual(sent["state"], {"conversation": "user:\nhi", "latest_message": "Why is the sky blue?"})
+        self.assertEqual(list(sent["questions"]), ["needs_code"])
+        self.assertEqual(sent["questions"]["needs_code"]["type"], "noul")
+
+    def test_route_rejects_bad_input_and_bad_answers(self):
+        with self.assertRaises(ValueError):
+            bridge.handle({"mode": "route", "latest": ""})
+        bad = lambda payload, api_key, timeout: {"answers": {"needs_code": {"type": "noul", "noul": 7}}}
+        with patch.object(jev, "ask_jev", bad), patch.object(jev, "api_key_from_env", lambda: "key"):
+            with self.assertRaises(ValueError):
+                bridge.handle({"mode": "route", "latest": "hi"})
+
 
 if __name__ == "__main__":
     unittest.main()

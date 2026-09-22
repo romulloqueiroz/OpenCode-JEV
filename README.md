@@ -48,7 +48,13 @@ plugin automatically; do not also add it to a plugin list.
 
 ## How it works
 
-Before the visible agent starts generating its response, a private child session
+First, JEV answers one yes/no question: does your latest message need code
+written or changed? If not (an explanation, a plan, a question, small talk), the
+worker answers once, with read-only access to the project, and there is no
+grading loop. Code requests, including code snippets, go through the loop below.
+If this check fails, the turn fails; it never falls back to an ungraded answer.
+
+For code, before the visible agent starts generating its response, a private child session
 drafts the answer. The worker explores the project itself with read-only tools
 (`read`, `grep`, `glob`), so large repositories work: only what it opens is sent
 to the model. It returns an answer plus proposed changes, usually as exact
@@ -116,13 +122,17 @@ OpenCode after changing it. Defaults:
   "timeout": 60,
   "generationTimeout": 300,
   "maxWorkerSteps": 30,
+  "codeThreshold": 0.5,
   "maxSourceBytes": 200000
 }
 ```
 
 `timeout` limits each evaluator process in seconds, including API retries.
 `generationTimeout` limits each private worker request, including its tool calls.
-`maxWorkerSteps` caps model calls per worker request (1–200). `maxSourceBytes`
+`maxWorkerSteps` caps model calls per worker request (1–200). `codeThreshold`
+is how sure JEV must be that a message needs code before the loop runs (0–1);
+lower it if code requests get answered directly, and set it to `0` to always run
+the loop. `maxSourceBytes`
 caps each draft and the bundle sent to JEV (maximum 2 MB); changed files must fit,
 and files the worker read are included until the cap is reached. Project size is
 not limited. `maxRevisions: 0` evaluates only the initial draft.

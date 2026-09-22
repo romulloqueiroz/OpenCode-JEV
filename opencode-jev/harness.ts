@@ -46,6 +46,8 @@ export interface HarnessOptions {
   model?: ModelRef
   variant?: string
   task: string
+  /** The latest user message, for routing. Defaults to the whole task. */
+  request?: string
   config: JevConfig
   signal?: AbortSignal
   progress?: (message: string) => Promise<void>
@@ -58,6 +60,8 @@ export interface HarnessDeps {
   runBridge: typeof runBridge
   saveRound: typeof saveRound
   evaluate?: (payload: Record<string, unknown>, options: { signal?: AbortSignal }) => Promise<EvaluationResult>
+  /** Probability that the request needs code written or changed. */
+  route?: (payload: { latest: string; conversation: string }, options: { signal?: AbortSignal }) => Promise<number>
 }
 
 // Malformed drafts go back to the worker this many times per round before the run fails.
@@ -103,6 +107,8 @@ Every draft is relative to the ORIGINAL files: nothing is written to disk until 
 
 Schema:
 ${JSON.stringify(DRAFT_SCHEMA)}`
+
+const CHAT = `Answer the user's latest message directly, in plain Markdown (not JSON). You may inspect the project with the read, grep and glob tools. Do not propose or write file changes.`
 
 function unwrap(response: Response, label: string): any {
   if (response?.error) throw new Error(`${label} failed`)
@@ -153,13 +159,24 @@ async function saveRound(directory: string, runID: string, round: number, value:
 
 export function createHarness(overrides: Partial<HarnessDeps> = {}): Harness {
   const deps: HarnessDeps = { applyDraft, runBridge, saveRound, ...overrides }
-  return async function runHarness({ client, directory, sessionID, model, variant, task, config, signal, progress = async () => {} }) {
+  return async function runHarness({ client, directory, sessionID, model, variant, task, request, config, signal, progress = async () => {} }) {
     signal?.throwIfAborted()
     if (!model?.providerID || !model?.modelID) throw new Error("Select an OpenCode model before using the JEV agent")
+    // JEV decides whether this turn needs code. Conversation skips the drafting loop.
+    let needsCode = 1
+    if (config.codeThreshold > 0) {
+      await progress("Checking whether this needs code")
+      const routing = { latest: request || task, conversation: task }
+      needsCode = deps.route ? await deps.route(routing, { signal })
+        : (await deps.runBridge({ python: config.python, directory, payload: { mode: "route", ...routing, timeout: config.timeout }, timeout: config.timeout, signal }))?.needs_code
+      signal?.throwIfAborted()
+      if (typeof needsCode !== "number" || !Number.isFinite(needsCode)) throw new Error("JEV returned an invalid routing answer")
+    }
+    const chat = needsCode < config.codeThreshold
     const rubric = config.rubricFile ? JSON.parse(await fs.readFile(path.resolve(directory, config.rubricFile), "utf8")) : undefined
     const runID = crypto.randomUUID()
     const created = unwrap(await client.session.create({ query: { directory }, body: {
-      parentID: sessionID, title: "JEV private draft and revision", permission: workerRuleset(),
+      parentID: sessionID, title: chat ? "JEV direct answer" : "JEV private draft and revision", permission: workerRuleset(),
     } }), "Creating private session")
     if (!created?.id) throw new Error("OpenCode did not create a private worker session")
     const childID = created.id
@@ -182,6 +199,20 @@ export function createHarness(overrides: Partial<HarnessDeps> = {}): Harness {
         requestSignal.removeEventListener("abort", stopWorker)
         requestSignal.throwIfAborted()
         signal?.throwIfAborted()
+      }
+    }
+
+    if (chat) {
+      try {
+        await progress("Answering directly (no code needed)")
+        const data = unwrap(await generate(`${CHAT}\n\nConversation:\n${task}`), "Worker request")
+        if (data?.info?.error) throw new Error(`Worker failed: ${data.info.error.name || "generation error"}`)
+        const answer = (data?.parts || []).filter((p: any) => p.type === "text").map((p: any) => p.text).join("").trim()
+        if (!answer) throw new Error("Worker returned an empty answer")
+        return { answer, changed: [], decision: "chat", childID }
+      } finally {
+        signal?.removeEventListener("abort", abort)
+        if (signal?.aborted) abort()
       }
     }
 

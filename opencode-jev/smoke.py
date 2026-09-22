@@ -29,6 +29,10 @@ import opencode_jev_bridge as bridge
 import jev_evaluate as jev
 jev.api_key_from_env=lambda: 'local-mock'
 def judge(payload,*args,**kwargs):
+ if 'needs_code' in payload['questions']:
+  # Routing: conversation questions skip the drafting loop.
+  chat='Explain' in payload['state']['latest_message']
+  return {'model':jev.DEFAULT_MODEL,'answers':{'needs_code':{'type':'noul','noul':0.05 if chat else 0.95}}}
  assert Path('answer.js').read_text() == 'export const answer = 0;\\n', 'draft was applied before evaluation finished'
  passed='SELECTED_FINAL' in payload['state']['candidate_code']
  answers={}
@@ -53,8 +57,13 @@ class Model(BaseHTTPRequestHandler):
   (ROOT/f'request-{state["requests"]}.json').write_text(json.dumps(req,indent=2))
   final=any('The JEV harness has finished' in json.dumps(m) for m in msgs)
   content='JEV local smoke'; tool_call=None
-  worker=any('Generate a structured draft for the JEV harness.' in json.dumps(m) for m in msgs if m.get('role')=='system')
-  if worker:
+  worker=any('You work privately for the JEV harness.' in json.dumps(m) for m in msgs if m.get('role')=='system')
+  direct=any("Answer the user's latest message directly" in json.dumps(m) for m in msgs)
+  if worker and direct:
+   state['direct']=state.get('direct',0)+1
+   if 'read' not in tool_names or set(tool_names)-{'read','grep','glob','list'}: state['errors'].append('direct answer tools are not read-only: '+str(tool_names))
+   content='CHAT_ANSWER: loops let a judge catch mistakes before you see them.'
+  elif worker:
    if state['scenario']=='cancel':
     worker_started.set(); release_worker.wait(20)
    if (PROJECT/'answer.js').read_text() != 'export const answer = 0;\n': state['errors'].append('early file change')
@@ -161,6 +170,23 @@ try:
  assert 'function answer() { return 2; }' in final_text,final_text
  assert 'PRIVATE_DRAFT_BAD' not in json.dumps(messages),'chat draft leaked'
  assert (PROJECT/'answer.js').read_text()=='export const answer = 0;\n','chat-only task edited files'
+ # A conversation question gets one direct answer: no drafts, no grading, no file changes.
+ state.update(scenario='conversation',drafts=0,presentations=0)
+ runs_before=len(list((PROJECT/'.opencode/jev').glob('runs/*/*.json')))
+ talk=api('/session',{'title':'JEV conversation smoke'})['id']
+ api('/session/'+talk+'/prompt_async',{'model':{'providerID':'mock','modelID':'mock'},'parts':[{'type':'text','text':'Explain why evaluator-optimizer loops help.'}]})
+ deadline=time.monotonic()+30
+ while time.monotonic()<deadline:
+  messages=api('/session/'+talk+'/message')
+  final_text='\n'.join(part.get('text','') for m in messages if m['info']['role']=='assistant' for part in m['parts'] if part['type']=='text')
+  if 'CHAT_ANSWER' in final_text or 'JEV harness failed' in final_text: break
+  time.sleep(.1)
+ else: raise RuntimeError('conversation answer did not finish')
+ assert not state['errors'],state['errors']
+ assert final_text=='CHAT_ANSWER: loops let a judge catch mistakes before you see them.',final_text
+ assert state['drafts']==0 and state['direct']==1,state
+ assert len(list((PROJECT/'.opencode/jev').glob('runs/*/*.json')))==runs_before,'conversation was graded'
+ assert (PROJECT/'answer.js').read_text()=='export const answer = 0;\n','conversation edited files'
  # Abort the visible turn while the private provider request is still blocked.
  state.update(scenario='cancel',drafts=0,presentations=0)
  cancelled=api('/session',{'title':'JEV cancellation smoke'})['id']
@@ -179,7 +205,7 @@ try:
  assert state['presentations']==0,'cancelled draft was presented'
  assert (PROJECT/'answer.js').read_text()=='export const answer = 0;\n','cancelled draft was applied'
  assert len(list((PROJECT/'.opencode/jev').glob('runs/*/*.json')))==4,'cancelled draft was evaluated'
- print(json.dumps({'success':True,'opencode':subprocess.check_output(['opencode','--version'],text=True).strip(),'scenarios':['read-only tool use','search/replace edits','verbatim result','chat-only code','parent cancellation'],'evaluatedDrafts':4,'privateSessionsReadable':True,'artifacts':str(ROOT)}))
+ print(json.dumps({'success':True,'opencode':subprocess.check_output(['opencode','--version'],text=True).strip(),'scenarios':['read-only tool use','search/replace edits','verbatim result','chat-only code','conversation routing','parent cancellation'],'evaluatedDrafts':4,'privateSessionsReadable':True,'artifacts':str(ROOT)}))
 finally:
  release_worker.set()
  p.terminate()

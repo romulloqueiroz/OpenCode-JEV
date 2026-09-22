@@ -191,7 +191,41 @@ def concise_feedback(report: dict) -> str:
     return "\n".join(lines)
 
 
+# One yes/no judgment that decides between the drafting loop and a direct answer.
+ROUTE_QUESTION = {
+    "type": "noul",
+    "instructions": "Does answering `latest_message` require producing or changing code? Use `conversation` only to resolve what the latest message refers to.",
+    "criteria": {
+        "true": "The user wants code written or changed: new code, edits to project files, a bug fix, a refactor, tests, or a code snippet in the reply.",
+        "false": "The user wants conversation: an explanation, opinion, plan, comparison, brainstorm, review comments, a question about how something works, or small talk, even when it mentions code.",
+    },
+}
+
+
+def route(request: dict) -> dict:
+    latest, conversation = request.get("latest"), request.get("conversation", "")
+    if not isinstance(latest, str) or not latest.strip():
+        raise ValueError("latest must be a nonempty string")
+    if not isinstance(conversation, str) or len(latest) + len(conversation) > MAX_TASK_CHARS:
+        raise ValueError("conversation must be a string within the task limit")
+    timeout = request.get("timeout", 60.0)
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0 or timeout > 3600:
+        raise ValueError("timeout must be a positive finite number no greater than 3600")
+    payload = {
+        "model": jev.DEFAULT_MODEL,
+        "state": {"conversation": conversation, "latest_message": latest},
+        "questions": {"needs_code": ROUTE_QUESTION},
+    }
+    raw = jev.ask_jev(payload, jev.api_key_from_env(), timeout=float(timeout))
+    answer = raw.get("answers", {}).get("needs_code") if isinstance(raw, dict) else None
+    if not isinstance(answer, dict) or answer.get("type") != "noul":
+        raise ValueError("JEV returned no routing answer")
+    return {"needs_code": jev.probability(answer.get("noul"), "needs_code")}
+
+
 def handle(request: object) -> dict:
+    if isinstance(request, dict) and request.get("mode") == "route":
+        return route(request)
     task, files, previous, supplied_rubric, timeout = validate_request(request)
     rubric = copy.deepcopy(supplied_rubric) if supplied_rubric is not None else generic_rubric(task)
     source = source_bundle(files)

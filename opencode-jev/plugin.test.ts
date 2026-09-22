@@ -35,7 +35,7 @@ test("pre-generation hook waits for harness and exposes only selected result", a
   let release!: () => void, started!: () => void
   const gate = new Promise<void>(r => { release = r }), begun = new Promise<void>(r => { started = r })
   let calls = 0
-  const s = await setup(async (args: HarnessOptions) => { calls++; assert.deepEqual(args.model, model); started(); await gate; return { answer: "SELECTED_FINAL", changed: ["x.js"], decision: "rubric_satisfied", rounds: 1, selectedRound: 1 } })
+  const s = await setup(async (args: HarnessOptions) => { calls++; assert.deepEqual(args.model, model); assert.equal(args.request, "Implement X"); started(); await gate; return { answer: "SELECTED_FINAL", changed: ["x.js"], decision: "rubric_satisfied", rounds: 1, selectedRound: 1 } })
   await s.send()
   let returned = false
   const pending = s.transform().then(result => { returned = true; return result })
@@ -104,6 +104,10 @@ test("disabled plugin changes no agents or messages", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "jev-disabled-")); roots.push(directory)
   await writeFile(path.join(directory, "opencode-jev.json"), '{"enabled":false}')
   assert.deepEqual(await createJevPlugin()({ directory, client }), {})
+})
+
+test("direct conversational answers are shown without a JEV verdict", () => {
+  assert.equal(render({ answer: "Just an explanation.", changed: [], decision: "chat" }), "Just an explanation.")
 })
 
 test("the rendered reply lists unresolved findings when JEV did not approve", () => {
