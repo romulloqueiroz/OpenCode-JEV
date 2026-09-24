@@ -55,7 +55,11 @@ grading loop. Code requests, including code snippets, go through the loop below.
 If this check fails, the turn fails; it never falls back to an ungraded answer.
 
 For code, before the visible agent starts generating its response, a private child session
-drafts the answer. The worker explores the project itself with read-only tools
+first lists 1–8 specific checks the task requires (for example, "an empty list
+returns 0"). The list is fixed for the whole run. JEV grades each check yes/no
+alongside the general rubric, so when it is unsure, the feedback names the checks
+it doubts instead of only a probability. A malformed checklist goes back to the
+worker, like a malformed draft. The same session then drafts the answer. The worker explores the project itself with read-only tools
 (`read`, `grep`, `glob`), so large repositories work: only what it opens is sent
 to the model. It returns an answer plus proposed changes, usually as exact
 search/replace edits. The harness applies those edits in memory and sends JEV the

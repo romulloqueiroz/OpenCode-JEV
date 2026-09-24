@@ -20,6 +20,8 @@ MAX_TASK_CHARS = 200_000
 MAX_FILES = 512
 MAX_FILE_CHARS = 4 * 1024 * 1024
 MAX_TOTAL_SOURCE_CHARS = 10 * 1024 * 1024
+MAX_CHECKS = 8
+MAX_CHECK_CHARS = 300
 
 
 def generic_rubric(task: str) -> dict:
@@ -96,6 +98,20 @@ def generic_rubric(task: str) -> dict:
     return {"name": "opencode-task-quality-v1", "provenance": "Derived solely from the original user task by the OpenCode bridge; generic evaluation dimensions do not add task requirements.", "specification": specification, "targets": targets}
 
 
+def with_checks(rubric: dict, checks: list[str]) -> dict:
+    """Add one yes/no target per specific check so JEV's doubts have names.
+
+    Generic targets only say how sure JEV is; a doubted check says what about.
+    """
+    targets = [{
+        "id": f"check_{number}", "type": "noul", "importance": "important", "category": "check",
+        "requirement": "Check derived from the original task: " + check,
+        "question": "Does the implementation satisfy this specific check: " + check,
+        "revision_target": "Make sure: " + check,
+    } for number, check in enumerate(checks, 1)]
+    return {**rubric, "targets": rubric["targets"] + targets}
+
+
 def source_bundle(files: list[dict]) -> str:
     """Create a deterministic source bundle using explicit path delimiters."""
     ordered = sorted(files, key=lambda item: item["path"])
@@ -105,7 +121,7 @@ def source_bundle(files: list[dict]) -> str:
     )
 
 
-def validate_request(request: object) -> tuple[str, list[dict], dict | None, dict | None, float]:
+def validate_request(request: object) -> tuple[str, list[dict], dict | None, dict | None, float, list[str]]:
     if not isinstance(request, dict):
         raise ValueError("Request must be a JSON object")
     task = request.get("task")
@@ -147,7 +163,11 @@ def validate_request(request: object) -> tuple[str, list[dict], dict | None, dic
     timeout = request.get("timeout", 60.0)
     if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0 or timeout > 3600:
         raise ValueError("timeout must be a positive finite number no greater than 3600")
-    return task, clean, previous, rubric, float(timeout)
+    checks = request.get("checks", [])
+    if (not isinstance(checks, list) or len(checks) > MAX_CHECKS
+            or any(not isinstance(c, str) or not c.strip() or len(c) > MAX_CHECK_CHARS for c in checks)):
+        raise ValueError(f"checks must be a list of up to {MAX_CHECKS} nonempty strings")
+    return task, clean, previous, rubric, float(timeout), [c.strip() for c in checks]
 
 
 def bridge_revision_messages(source: str, report: dict) -> list[dict]:
@@ -171,8 +191,12 @@ def concise_feedback(report: dict) -> str:
     lines = [f"JEV recommends revision; focus on: {', '.join(report['focus_ids']) or 'the unresolved findings'}."]
     if preserved:
         lines.append(f"Preserve satisfied targets: {', '.join(preserved)}.")
+    # Doubted checks are the specific findings, so list every one, not only the focus.
+    shown = report["focus_ids"] + [row["id"] for row in report["targets"]
+                                   if row.get("category") == "check" and row["status"] != "meets_target"
+                                   and row["id"] not in report["focus_ids"]]
     for row in report["targets"]:
-        if row["id"] in report["focus_ids"]:
+        if row["id"] in shown:
             detail = f"{row['status']} ({row['probability_meets_target']:.2f}) — {row['revision_target']}"
             if row["type"] == "score":
                 score = row["answer"]["score"]
@@ -182,6 +206,10 @@ def concise_feedback(report: dict) -> str:
             if row.get("preserve_targets"):
                 detail += " Linked requirements to preserve: " + ", ".join(row["preserve_targets"]) + "."
             lines.append(f"{row['id']}: {detail}")
+    checks = [row for row in report["targets"] if row.get("category") == "check"]
+    if checks and all(row["status"] == "meets_target" for row in checks):
+        lines.append("Every specific check passed, so JEV's doubt is about something they do not cover. "
+                     "Look for task requirements or edge cases outside the checks.")
     lines.append("Preserve requirements already met. Uncertain findings require inspection and are not confirmed defects.")
     comparison = report.get("previous_comparison")
     if comparison:
@@ -226,8 +254,8 @@ def route(request: dict) -> dict:
 def handle(request: object) -> dict:
     if isinstance(request, dict) and request.get("mode") == "route":
         return route(request)
-    task, files, previous, supplied_rubric, timeout = validate_request(request)
-    rubric = copy.deepcopy(supplied_rubric) if supplied_rubric is not None else generic_rubric(task)
+    task, files, previous, supplied_rubric, timeout, checks = validate_request(request)
+    rubric = with_checks(copy.deepcopy(supplied_rubric) if supplied_rubric is not None else generic_rubric(task), checks)
     source = source_bundle(files)
     report = jev.evaluate(source, rubric=rubric, previous_report=previous, timeout=timeout, api_key=jev.api_key_from_env())
     report["revision_messages"] = bridge_revision_messages(source, report)

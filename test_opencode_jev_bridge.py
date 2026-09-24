@@ -68,6 +68,23 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("caller's requested format", messages[0]["content"])
         self.assertIn("do not change the live workspace", messages[0]["content"])
 
+    def test_checks_become_named_targets_and_feedback(self):
+        with patch.object(bridge.jev, "api_key_from_env", return_value="secret"), patch.object(bridge.jev, "evaluate", side_effect=lambda source, **kw: fake_report(source, kw["rubric"])) as evaluate:
+            result = bridge.handle({"task": "x", "files": [{"path": "x", "content": "source"}], "checks": ["empty input returns 0", " negative numbers are rejected "]})
+        targets = evaluate.call_args.kwargs["rubric"]["targets"]
+        self.assertEqual([t["id"] for t in targets[-2:]], ["check_1", "check_2"])
+        self.assertIn("negative numbers are rejected", targets[-1]["question"])
+        # Every doubted check is named, even beyond the focus limit.
+        self.assertIn("check_1:", result["feedback"])
+        self.assertIn("check_2:", result["feedback"])
+        self.assertIn("Make sure: empty input returns 0", result["feedback"])
+
+    def test_feedback_says_when_every_check_passed(self):
+        rubric = bridge.with_checks(bridge.generic_rubric("x"), ["empty input returns 0"])
+        report = fake_report("source", rubric)
+        report["targets"][-1]["status"] = "meets_target"
+        self.assertIn("Every specific check passed", bridge.concise_feedback(report))
+
     def test_malformed_requests_fail_cli(self):
         proc = subprocess.run([sys.executable, "opencode_jev_bridge.py"], input=b'{"task":"","files":[]}', capture_output=True)
         self.assertNotEqual(proc.returncode, 0)
@@ -78,6 +95,9 @@ class BridgeTests(unittest.TestCase):
             {"task": "x", "files": [{"path": "a", "content": "x"}, {"path": "a", "content": "y"}]},
             {"task": "x", "files": [{"path": "a", "content": "x"}], "timeout": float("nan")},
             {"task": "x", "files": [{"path": "a", "content": "x"}], "rubric": []},
+            {"task": "x", "files": [{"path": "a", "content": "x"}], "checks": ["ok", " "]},
+            {"task": "x", "files": [{"path": "a", "content": "x"}], "checks": ["c"] * 9},
+            {"task": "x", "files": [{"path": "a", "content": "x"}], "checks": "not a list"},
         ]
         for case in cases:
             with self.subTest(case=case):

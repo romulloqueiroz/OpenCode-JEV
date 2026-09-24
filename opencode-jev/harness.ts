@@ -108,6 +108,22 @@ Every draft is relative to the ORIGINAL files: nothing is written to disk until 
 Schema:
 ${JSON.stringify(DRAFT_SCHEMA)}`
 
+// Specific checks JEV grades one by one, so an unsure verdict names what it doubts.
+const MAX_CHECKS = 8, MAX_CHECK_CHARS = 300
+const CHECKLIST = `Before drafting, make a checklist. Inspect the project with the read, grep and glob tools as needed, then list 3 to ${MAX_CHECKS} specific things a correct solution to the task must do. Each check is one concrete, verifiable behavior grounded in the task: an input and its expected result, an interface, or an edge case the task clearly implies. Do not invent requirements. Keep each check under ${MAX_CHECK_CHARS} characters. JEV grades your solution against each check.
+
+Return ONLY a JSON object: {"checks": ["...", "..."]}`
+
+export function decodeChecks(response: Response): string[] {
+  const data = unwrap(response, "Worker request")
+  if (data?.info?.error) throw new Error(`Worker failed: ${data.info.error.name || "generation error"}`)
+  const value: any = parseJson((data?.parts || []).filter((p: any) => p.type === "text").map((p: any) => p.text).join("").trim())
+  const checks = Array.isArray(value?.checks) ? value.checks : undefined
+  if (!checks?.length || checks.length > MAX_CHECKS || checks.some((c: unknown) => typeof c !== "string" || !c.trim() || c.length > MAX_CHECK_CHARS))
+    throw new DraftError(`Checklist must be {"checks": [...]} with 1 to ${MAX_CHECKS} nonempty strings under ${MAX_CHECK_CHARS} characters`)
+  return [...new Set(checks.map((c: string) => c.trim()))] as string[]
+}
+
 const CHAT = `Answer the user's latest message directly, in plain Markdown (not JSON). You may inspect the project with the read, grep and glob tools. Do not propose or write file changes.`
 
 function unwrap(response: Response, label: string): any {
@@ -221,11 +237,21 @@ export function createHarness(overrides: Partial<HarnessDeps> = {}): Harness {
     const seen = new Set<string>()
     const originals = new Map<string, Original>()
     try {
+      await progress("Listing what to check")
+      let checks: string[]
+      let checklistPrompt = `${CHECKLIST}\n\nTask and conversation context:\n${task}`
+      for (let attempt = 0; ; attempt++) {
+        try { checks = decodeChecks(await generate(checklistPrompt)); break }
+        catch (error) {
+          if (!(error instanceof DraftError) || attempt >= MAX_REPAIRS) throw error
+          checklistPrompt = `Your checklist could not be used: ${error.message}\n\nReturn ONLY a JSON object: {"checks": ["...", "..."]}`
+        }
+      }
       for (let round = 0; round <= config.maxRevisions; round++) {
         signal?.throwIfAborted()
         await progress(round ? `Revising privately (${round}/${config.maxRevisions})` : "Drafting privately")
         let prompt = round === 0
-          ? `Complete the user's current task. This is a PRIVATE draft: you cannot modify the user's project. Use the read, grep and glob tools to inspect the project in ${directory}, and read every file before you change it. Only propose file changes if the task requests them. Do not modify the evaluator, rubric, or plugin configuration to affect the grade.\n\nTask and conversation context:\n${task}\n\n${INSTRUCTIONS}`
+          ? `Now complete the user's current task so that it passes your checklist. This is a PRIVATE draft: you cannot modify the user's project. Use the read, grep and glob tools to inspect the project in ${directory}, and read every file before you change it. Only propose file changes if the task requests them. Do not modify the evaluator, rubric, or plugin configuration to affect the grade.\n\nTask and conversation context:\n${task}\n\n${INSTRUCTIONS}`
           : `Revise the retained draft using JEV's feedback below. The files on disk are still the ORIGINAL files, so return the COMPLETE draft again, including edits you keep. Preserve satisfied behavior. Uncertain judgments are inspection prompts, not proven defects.\n\nRetained draft:\n${JSON.stringify(best!.draft)}\n\nJEV feedback on the last attempt:\n${feedback}\n\n${INSTRUCTIONS}`
         let draft: Draft, changes: Change[]
         for (let attempt = 0; ; attempt++) {
@@ -245,7 +271,7 @@ export function createHarness(overrides: Partial<HarnessDeps> = {}): Harness {
         seen.add(fingerprint)
         await progress(`Evaluating private draft (${round + 1})`)
         const context = await readContext(directory, await filesRead(client, childID, directory), config.maxSourceBytes)
-        const payload: Record<string, unknown> = { task, files: candidateFiles(context, changes, draft.answer, config.maxSourceBytes), timeout: config.timeout,
+        const payload: Record<string, unknown> = { task, checks, files: candidateFiles(context, changes, draft.answer, config.maxSourceBytes), timeout: config.timeout,
           ...(rubric ? { rubric } : {}), ...(best ? { previous_report: best.report } : {}) }
         const result: EvaluationResult = deps.evaluate ? await deps.evaluate(payload, { signal })
           : await deps.runBridge({ python: config.python, directory, payload, timeout: config.timeout, signal })
@@ -260,7 +286,7 @@ export function createHarness(overrides: Partial<HarnessDeps> = {}): Harness {
         if (promoted) { best = { draft, changes, report, round: rounds }; stalls = 0 }
         else stalls++
         feedback = result.feedback
-        audit = await deps.saveRound(directory, runID, rounds, { task, model, childID, draft, changed: changes.map(c => c.path), report, promoted, bestRound: best!.round })
+        audit = await deps.saveRound(directory, runID, rounds, { task, checks, model, childID, draft, changed: changes.map(c => c.path), report, promoted, bestRound: best!.round })
         if (promoted && report.decision === "rubric_satisfied") { stopReason = "rubric satisfied"; break }
         if (stalls >= config.maxStalls) { stopReason = "no material improvement"; break }
         if (round < config.maxRevisions && (typeof feedback !== "string" || !feedback.trim())) throw new Error("JEV returned no revision feedback")
@@ -270,7 +296,7 @@ export function createHarness(overrides: Partial<HarnessDeps> = {}): Harness {
       await progress("Applying the selected result")
       const changed = await deps.applyDraft(directory, originals, best.changes, signal)
       return { answer: best.draft.answer, changed, rounds, selectedRound: best.round, decision: best.report.decision,
-        stopReason, unresolved: best.report.unresolved_ids || [], audit, childID }
+        stopReason, unresolved: (best.report.unresolved_ids || []).map(id => checks[Number(id.match(/^check_(\d+)$/)?.[1]) - 1] ?? id), audit, childID }
     } finally {
       signal?.removeEventListener("abort", abort)
       if (signal?.aborted) abort()
