@@ -34,6 +34,7 @@ def judge(payload,*args,**kwargs):
   chat='Explain' in payload['state']['latest_message']
   return {'model':jev.DEFAULT_MODEL,'answers':{'needs_code':{'type':'noul','noul':0.05 if chat else 0.95}}}
  assert Path('answer.js').read_text() == 'export const answer = 0;\\n', 'draft was applied before evaluation finished'
+ assert 'check_1' in payload['questions'], 'worker checklist was not sent to JEV'
  passed='SELECTED_FINAL' in payload['state']['candidate_code']
  answers={}
  for name,q in payload['questions'].items():
@@ -70,7 +71,12 @@ class Model(BaseHTTPRequestHandler):
    if req['model'] != 'mock': state['errors'].append('worker model changed')
    if 'read' not in tool_names or set(tool_names)-{'read','grep','glob','list'}: state['errors'].append('worker tools are not read-only: '+str(tool_names))
    if 'export const answer = 0' in json.dumps([m for m in msgs if m.get('role')!='tool']): state['errors'].append('project pasted into worker prompt')
-   if state['scenario']=='files' and not any(m.get('role')=='tool' for m in msgs):
+   last_user=json.dumps([m for m in msgs if m.get('role')=='user'][-1:])
+   if 'make a checklist' in last_user:
+    # The harness asks for specific checks before the first draft.
+    state['checklists']=state.get('checklists',0)+1
+    content=json.dumps({'checks':['answer.js exports answer equal to 2']})
+   elif state['scenario']=='files' and not any(m.get('role')=='tool' for m in msgs):
     # First step: inspect the project with the read tool, as a real worker would.
     tool_call={'index':0,'id':'call_read','type':'function','function':{'name':'read','arguments':json.dumps({'filePath':str(PROJECT/'answer.js')})}}
    else:
@@ -140,7 +146,8 @@ try:
    assert final_text.startswith('SELECTED_FINAL: Updated answer.js.') and '**Changed files:** answer.js' in final_text and 'Done' not in final_text,final_text
    assert 'PRIVATE_DRAFT_BAD' not in json.dumps(messages),'private draft leaked into main chat'
    assert len([m for m in messages if m['info']['role']=='user'])==1,'feedback added to main chat'
-   assert state['drafts']==2,state
+   assert state['drafts']==2 and state['checklists']==1,state
+   assert records[0]['checks']==['answer.js exports answer equal to 2'],records[0].get('checks')
    private=api('/session/'+records[0]['childID']+'/message')
    assert 'PRIVATE_DRAFT_BAD' in json.dumps(private),'draft missing from private worker'
    assert records[1]['model']=={'providerID':'mock','modelID':'mock'},records[1]['model']

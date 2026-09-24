@@ -55,8 +55,8 @@ grading loop. Code requests, including code snippets, go through the loop below.
 If this check fails, the turn fails; it never falls back to an ungraded answer.
 
 For code, before the visible agent starts generating its response, a private child session
-first lists 1–8 specific checks the task requires (for example, "an empty list
-returns 0"). The list is fixed for the whole run. JEV grades each check yes/no
+first lists 1–8 specific checks the task requires, favoring edge and error cases
+(for example, "an empty list returns 0"). The list is fixed for the whole run. JEV grades each check yes/no
 alongside the general rubric, so when it is unsure, the feedback names the checks
 it doubts instead of only a probability. A malformed checklist goes back to the
 worker, like a malformed draft. The same session then drafts the answer. The worker explores the project itself with read-only tools
@@ -73,6 +73,12 @@ JEV's feedback goes back to that same worker and selected model. The controller
 retains the best evaluated candidate and rejects revisions with detected
 regressions or incomplete comparisons. It stops when the rubric is satisfied,
 the revision budget expires, progress stalls, or a candidate repeats.
+
+JEV returns probabilities, not explanations. When it is unsure but every check
+passed, the worker lists up to 8 specific defects it suspects in its draft, and
+JEV judges whether each is real. Those judged likely real (probability at least
+0.5) are named in the feedback. If JEV confirms none, the loop stops rather than
+revising with nothing specific to fix.
 
 Only then does it apply the selected candidate's files. The plugin writes the
 reply you see itself: the selected answer verbatim, changed files, unresolved

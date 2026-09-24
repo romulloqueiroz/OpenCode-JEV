@@ -85,6 +85,20 @@ class BridgeTests(unittest.TestCase):
         report["targets"][-1]["status"] = "meets_target"
         self.assertIn("Every specific check passed", bridge.concise_feedback(report))
 
+    def test_probe_asks_jev_whether_each_suspected_defect_is_real(self):
+        sent = {}
+        def fake_ask(payload, api_key, timeout):
+            sent.update(payload)
+            return {"model": jev.DEFAULT_MODEL, "answers": {"suspicion_1": {"type": "noul", "noul": 0.7}, "suspicion_2": {"type": "noul", "noul": 0.05}}}
+        with patch.object(jev, "ask_jev", fake_ask), patch.object(jev, "api_key_from_env", lambda: "key"):
+            result = bridge.handle({"mode": "probe", "task": "Add x", "files": [{"path": "x.js", "content": "code"}], "suspicions": ["null input crashes", "too slow"]})
+        self.assertEqual(result, {"suspicions": [{"suspicion": "null input crashes", "probability": 0.7}, {"suspicion": "too slow", "probability": 0.05}]})
+        self.assertIn("Add x", sent["state"]["specification"])
+        self.assertIn("x.js", sent["state"]["candidate_code"])
+        self.assertEqual(sent["questions"]["suspicion_1"]["instructions"]["suspected_defect"], "null input crashes")
+        with self.assertRaises(ValueError):
+            bridge.handle({"mode": "probe", "task": "Add x", "files": [{"path": "x.js", "content": "code"}], "suspicions": []})
+
     def test_malformed_requests_fail_cli(self):
         proc = subprocess.run([sys.executable, "opencode_jev_bridge.py"], input=b'{"task":"","files":[]}', capture_output=True)
         self.assertNotEqual(proc.returncode, 0)

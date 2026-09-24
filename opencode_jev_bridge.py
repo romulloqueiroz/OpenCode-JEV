@@ -251,9 +251,39 @@ def route(request: dict) -> dict:
     return {"needs_code": jev.probability(answer.get("noul"), "needs_code")}
 
 
+def probe(request: dict) -> dict:
+    """Ask JEV whether each suspected defect is real, so an unsure verdict gets a name."""
+    task, files, _, supplied_rubric, timeout, suspicions = validate_request({**request, "checks": request.get("suspicions", [])})
+    if not suspicions:
+        raise ValueError("suspicions must be a nonempty list")
+    specification = (supplied_rubric or generic_rubric(task))["specification"]
+    questions = {f"suspicion_{number}": {
+        "type": "noul",
+        "instructions": {
+            "evaluation_rules": jev.JUDGE_RULES,
+            "suspected_defect": suspicion,
+            "question": "Is this suspected defect real? Answer yes only if the candidate actually behaves as described "
+                        "AND `specification` requires different behavior. A suspicion about behavior the code does not have, "
+                        "or about a requirement the task does not state or clearly imply, is not a real defect.",
+        },
+    } for number, suspicion in enumerate(suspicions, 1)}
+    payload = {"model": jev.DEFAULT_MODEL, "state": {"specification": specification, "candidate_code": source_bundle(files)}, "questions": questions}
+    raw = jev.ask_jev(payload, jev.api_key_from_env(), timeout=timeout)
+    answers = raw.get("answers", {}) if isinstance(raw, dict) else {}
+    result = []
+    for key, suspicion in zip(questions, suspicions):
+        answer = answers.get(key)
+        if not isinstance(answer, dict) or answer.get("type") != "noul":
+            raise ValueError("JEV returned no answer for a suspected defect")
+        result.append({"suspicion": suspicion, "probability": jev.probability(answer.get("noul"), key)})
+    return {"suspicions": result}
+
+
 def handle(request: object) -> dict:
     if isinstance(request, dict) and request.get("mode") == "route":
         return route(request)
+    if isinstance(request, dict) and request.get("mode") == "probe":
+        return probe(request)
     task, files, previous, supplied_rubric, timeout, checks = validate_request(request)
     rubric = with_checks(copy.deepcopy(supplied_rubric) if supplied_rubric is not None else generic_rubric(task), checks)
     source = source_bundle(files)

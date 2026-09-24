@@ -60,6 +60,8 @@ export interface HarnessDeps {
   runBridge: typeof runBridge
   saveRound: typeof saveRound
   evaluate?: (payload: Record<string, unknown>, options: { signal?: AbortSignal }) => Promise<EvaluationResult>
+  /** Probability that each suspected defect is real. */
+  probe?: (payload: Record<string, unknown>, options: { signal?: AbortSignal }) => Promise<{ suspicion: string; probability: number }[]>
   /** Probability that the request needs code written or changed. */
   route?: (payload: { latest: string; conversation: string }, options: { signal?: AbortSignal }) => Promise<number>
 }
@@ -108,20 +110,26 @@ Every draft is relative to the ORIGINAL files: nothing is written to disk until 
 Schema:
 ${JSON.stringify(DRAFT_SCHEMA)}`
 
-// Specific checks JEV grades one by one, so an unsure verdict names what it doubts.
-const MAX_CHECKS = 8, MAX_CHECK_CHARS = 300
-const CHECKLIST = `Before drafting, make a checklist. Inspect the project with the read, grep and glob tools as needed, then list 3 to ${MAX_CHECKS} specific things a correct solution to the task must do. Each check is one concrete, verifiable behavior grounded in the task: an input and its expected result, an interface, or an edge case the task clearly implies. Do not invent requirements. Keep each check under ${MAX_CHECK_CHARS} characters. JEV grades your solution against each check.
+// JEV only returns probabilities. To name what it doubts, it grades specific
+// statements: checks listed before drafting, and defects suspected after.
+const MAX_ITEMS = 8, MAX_ITEM_CHARS = 300
+const CHECKLIST = `Before drafting, make a checklist. Inspect the project with the read, grep and glob tools as needed, then list 3 to ${MAX_ITEMS} specific things a correct solution to the task must do. Each check is one concrete, verifiable behavior grounded in the task: an input and its expected result, an interface, or an error case. Favor the cases a careless implementation gets wrong (edge cases, invalid input, boundaries) over the obvious ones. Do not invent requirements. Keep each check under ${MAX_ITEM_CHARS} characters. JEV grades your solution against each check.
 
 Return ONLY a JSON object: {"checks": ["...", "..."]}`
+const SUSPECT = (doubts: string) => `JEV is not yet confident your draft is correct (unsure about: ${doubts}), but it cannot say why. Review your draft as a skeptical reviewer and list 1 to ${MAX_ITEMS} specific defects it might have. Each names a concrete input or situation and how the code misbehaves against the task. Only list behavior the task states or clearly implies. JEV judges whether each one is real.
 
-export function decodeChecks(response: Response): string[] {
+Return ONLY a JSON object: {"suspicions": ["...", "..."]}`
+// A suspected defect at or above this probability is reported to the worker as real.
+const CONFIRMED = 0.5
+
+export function decodeList(response: Response, key: string): string[] {
   const data = unwrap(response, "Worker request")
   if (data?.info?.error) throw new Error(`Worker failed: ${data.info.error.name || "generation error"}`)
   const value: any = parseJson((data?.parts || []).filter((p: any) => p.type === "text").map((p: any) => p.text).join("").trim())
-  const checks = Array.isArray(value?.checks) ? value.checks : undefined
-  if (!checks?.length || checks.length > MAX_CHECKS || checks.some((c: unknown) => typeof c !== "string" || !c.trim() || c.length > MAX_CHECK_CHARS))
-    throw new DraftError(`Checklist must be {"checks": [...]} with 1 to ${MAX_CHECKS} nonempty strings under ${MAX_CHECK_CHARS} characters`)
-  return [...new Set(checks.map((c: string) => c.trim()))] as string[]
+  const items = Array.isArray(value?.[key]) ? value[key] : undefined
+  if (!items?.length || items.length > MAX_ITEMS || items.some((c: unknown) => typeof c !== "string" || !c.trim() || c.length > MAX_ITEM_CHARS))
+    throw new DraftError(`Reply must be {"${key}": [...]} with 1 to ${MAX_ITEMS} nonempty strings under ${MAX_ITEM_CHARS} characters`)
+  return [...new Set(items.map((c: string) => c.trim()))] as string[]
 }
 
 const CHAT = `Answer the user's latest message directly, in plain Markdown (not JSON). You may inspect the project with the read, grep and glob tools. Do not propose or write file changes.`
@@ -236,17 +244,19 @@ export function createHarness(overrides: Partial<HarnessDeps> = {}): Harness {
     let feedback: unknown = "", stalls = 0, rounds = 0, audit: string | undefined, stopReason = "revision budget"
     const seen = new Set<string>()
     const originals = new Map<string, Original>()
-    try {
-      await progress("Listing what to check")
-      let checks: string[]
-      let checklistPrompt = `${CHECKLIST}\n\nTask and conversation context:\n${task}`
+    async function askList(prompt: string, key: string): Promise<string[]> {
       for (let attempt = 0; ; attempt++) {
-        try { checks = decodeChecks(await generate(checklistPrompt)); break }
+        try { return decodeList(await generate(prompt), key) }
         catch (error) {
           if (!(error instanceof DraftError) || attempt >= MAX_REPAIRS) throw error
-          checklistPrompt = `Your checklist could not be used: ${error.message}\n\nReturn ONLY a JSON object: {"checks": ["...", "..."]}`
+          prompt = `Your reply could not be used: ${error.message}\n\nReturn ONLY a JSON object: {"${key}": ["...", "..."]}`
         }
       }
+    }
+
+    try {
+      await progress("Listing what to check")
+      const checks = await askList(`${CHECKLIST}\n\nTask and conversation context:\n${task}`, "checks")
       for (let round = 0; round <= config.maxRevisions; round++) {
         signal?.throwIfAborted()
         await progress(round ? `Revising privately (${round}/${config.maxRevisions})` : "Drafting privately")
@@ -286,8 +296,23 @@ export function createHarness(overrides: Partial<HarnessDeps> = {}): Harness {
         if (promoted) { best = { draft, changes, report, round: rounds }; stalls = 0 }
         else stalls++
         feedback = result.feedback
-        audit = await deps.saveRound(directory, runID, rounds, { task, checks, model, childID, draft, changed: changes.map(c => c.path), report, promoted, bestRound: best!.round })
+        // Unsure, yet no check failed: ask the worker what might be wrong and JEV which of it is real.
+        const unresolved = report.unresolved_ids || []
+        let suspicions: { suspicion: string; probability: number }[] | undefined
+        if (promoted && report.decision === "revise" && round < config.maxRevisions && !unresolved.some(id => id.startsWith("check_"))) {
+          await progress("Asking JEV what it doubts")
+          const list = await askList(SUSPECT(unresolved.join(", ")), "suspicions")
+          const probePayload = { mode: "probe", task, suspicions: list, files: payload.files, timeout: config.timeout, ...(rubric ? { rubric } : {}) }
+          suspicions = deps.probe ? await deps.probe(probePayload, { signal })
+            : (await deps.runBridge({ python: config.python, directory, payload: probePayload, timeout: config.timeout, signal }))?.suspicions
+          signal?.throwIfAborted()
+          if (!Array.isArray(suspicions)) throw new Error("JEV returned an invalid probe")
+          const real = suspicions.filter(s => s.probability >= CONFIRMED)
+          if (real.length) feedback += `\n\nJEV judged these specific defects likely real; fix them:\n${real.map(s => `- ${s.suspicion} (${s.probability.toFixed(2)})`).join("\n")}`
+        }
+        audit = await deps.saveRound(directory, runID, rounds, { task, checks, model, childID, draft, changed: changes.map(c => c.path), report, suspicions, promoted, bestRound: best!.round })
         if (promoted && report.decision === "rubric_satisfied") { stopReason = "rubric satisfied"; break }
+        if (suspicions && !suspicions.some(s => s.probability >= CONFIRMED)) { stopReason = "JEV unsure but found no specific defect"; break }
         if (stalls >= config.maxStalls) { stopReason = "no material improvement"; break }
         if (round < config.maxRevisions && (typeof feedback !== "string" || !feedback.trim())) throw new Error("JEV returned no revision feedback")
       }

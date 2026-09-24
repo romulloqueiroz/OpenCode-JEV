@@ -15,17 +15,19 @@ const model = { providerID: "mock", modelID: "chosen-model" }
 const draft = (value: number, files = true): Draft => ({ answer: `ANSWER_${value}`, files: files ? [{ path: "x.js", content: `export const x = ${value};` }] : [] })
 const report = (decision: JevReport["decision"], recommendation?: string): JevReport => ({ decision, unresolved_ids: decision === "revise" ? ["behavior"] : [],
   ...(recommendation ? { previous_comparison: { recommendation, gaps: [], possible_essential_regressions: [] } } : {}) })
-async function setup(drafts: unknown[], reports: JevReport[], overrides: Partial<HarnessDeps> = {}, checklists: unknown[] = []) {
+async function setup(drafts: unknown[], reports: JevReport[], overrides: Partial<HarnessDeps> = {}, lists: unknown[] = []) {
   const directory = await temp(); await writeFile(path.join(directory, "x.js"), "original")
-  const prompts: any[] = [], checklistPrompts: any[] = [], creates: any[] = [], evaluations: any[] = [], records: any[] = [], aborts: any[] = []
+  const prompts: any[] = [], listPrompts: any[] = [], probes: any[] = [], creates: any[] = [], evaluations: any[] = [], records: any[] = [], aborts: any[] = []
   const reads: string[] = []
   const client = { session: {
     async create(request: any) { creates.push(request); return { data: { id: "child" } } },
     async prompt(request: any): Promise<any> {
-      // Checklist requests come first and are answered separately from drafts.
-      const checklist = /make a checklist|checklist could not be used/.test(request.body.parts[0].text)
-      ;(checklist ? checklistPrompts : prompts).push(request)
-      const next = checklist ? (checklists.length ? checklists.shift() : { checks: ["x is 2"] }) : drafts.shift()
+      // Checklist and suspected-defect requests are answered separately from drafts.
+      const text = request.body.parts[0].text
+      const list = /make a checklist|skeptical reviewer|reply could not be used/.test(text)
+      ;(list ? listPrompts : prompts).push(request)
+      const next = !list ? drafts.shift() : lists.length ? lists.shift()
+        : /skeptical/.test(text) ? { suspicions: ["x may be off by one"] } : { checks: ["x is 2"] }
       return { data: { info: {}, parts: [{ type: "text", text: typeof next === "string" ? next : JSON.stringify(next) }] } }
     },
     async abort(request: any) { aborts.push(request); return {} },
@@ -34,8 +36,9 @@ async function setup(drafts: unknown[], reports: JevReport[], overrides: Partial
   const run = createHarness({ evaluate: async payload => {
     assert.equal(await readFile(path.join(directory, "x.js"), "utf8"), "original", "No draft may touch live files before selection")
     evaluations.push(payload); return { report: reports.shift(), feedback: "Fix behavior; preserve interface" }
-  }, route: async () => 0.9, saveRound: async (_d, _r, _n, record) => { records.push(record); return "audit.json" }, ...overrides })
-  return { directory, prompts, checklistPrompts, creates, evaluations, records, aborts, client, reads,
+  }, probe: async payload => { probes.push(payload); return (payload.suspicions as string[]).map(suspicion => ({ suspicion, probability: 0.9 })) },
+  route: async () => 0.9, saveRound: async (_d, _r, _n, record) => { records.push(record); return "audit.json" }, ...overrides })
+  return { directory, prompts, listPrompts, probes, creates, evaluations, records, aborts, client, reads,
     run: (options: Partial<HarnessOptions> = {}) => run({ client, directory, sessionID: "parent", model, task: "Set x to 2", config, ...options }) }
 }
 
@@ -55,14 +58,49 @@ test("the worker's checklist is sent to JEV every round and doubted checks are n
   const doubted: JevReport = { decision: "revise", unresolved_ids: ["check_2", "behavior"] }
   const s = await setup([draft(1)], [doubted], {}, ["no JSON", { checks: [" x is 2 ", "x is exported"] }])
   const result = await s.run({ config: { ...config, maxRevisions: 0 } })
-  assert.equal(s.checklistPrompts.length, 2, "A malformed checklist goes back to the worker")
-  assert.match(s.checklistPrompts[1].body.parts[0].text, /checklist could not be used/)
+  assert.equal(s.listPrompts.length, 2, "A malformed checklist goes back to the worker")
+  assert.match(s.listPrompts[1].body.parts[0].text, /reply could not be used/)
   assert.deepEqual(s.evaluations[0].checks, ["x is 2", "x is exported"])
   assert.deepEqual(result.unresolved, ["x is exported", "behavior"])
   assert.deepEqual(s.records[0].checks, ["x is 2", "x is exported"])
   const hopeless = await setup([draft(1)], [], {}, [{ checks: [] }, { checks: [""] }, { checks: "x" }])
-  await assert.rejects(hopeless.run(), /Checklist must be/)
+  await assert.rejects(hopeless.run(), /Reply must be \{"checks"/)
   assert.equal(hopeless.prompts.length, 0)
+})
+
+test("when JEV is unsure and no check failed, the defects it confirms are named in the feedback", async () => {
+  const s = await setup([draft(1), draft(2)], [report("revise"), report("rubric_satisfied", "improved_by_jev")], {
+    probe: async payload => { s.probes.push(payload); return [{ suspicion: "x ignores negatives", probability: 0.8 }, { suspicion: "x is slow", probability: 0.1 }] },
+  }, [{ checks: ["x is 2"] }, { suspicions: ["x ignores negatives", "x is slow"] }])
+  const result = await s.run()
+  assert.equal(result.decision, "rubric_satisfied")
+  assert.match(s.listPrompts[1].body.parts[0].text, /unsure about: behavior/)
+  assert.equal(s.probes[0].mode, "probe")
+  assert.deepEqual(s.probes[0].suspicions, ["x ignores negatives", "x is slow"])
+  assert.deepEqual(s.probes[0].files, s.evaluations[0].files, "JEV judges the suspicions against the same candidate")
+  const revision = s.prompts[1].body.parts[0].text
+  assert.match(revision, /x ignores negatives \(0\.80\)/)
+  assert.doesNotMatch(revision, /x is slow/, "Suspicions JEV rejects are not sent as defects")
+  assert.equal(s.records[0].suspicions.length, 2)
+})
+
+test("when JEV is unsure but confirms no suspected defect, the loop stops instead of wasting rounds", async () => {
+  const s = await setup([draft(1)], [report("revise")], {
+    probe: async payload => (payload.suspicions as string[]).map(suspicion => ({ suspicion, probability: 0.2 })),
+  })
+  const result = await s.run()
+  assert.equal(result.stopReason, "JEV unsure but found no specific defect")
+  assert.equal(result.answer, "ANSWER_1"); assert.equal(s.evaluations.length, 1)
+  assert.equal(await readFile(path.join(s.directory, "x.js"), "utf8"), "export const x = 1;")
+})
+
+test("a failed check is already specific, so it skips the probe; so does the last round", async () => {
+  const failedCheck: JevReport = { decision: "revise", unresolved_ids: ["check_1"] }
+  const s = await setup([draft(1), draft(2)], [failedCheck, report("rubric_satisfied", "improved_by_jev")])
+  await s.run()
+  const last = await setup([draft(1)], [report("revise")])
+  await last.run({ config: { ...config, maxRevisions: 0 } })
+  assert.equal(s.probes.length + last.probes.length, 0)
 })
 
 test("worker is read-only: everything denied except read tools, secrets and outside paths", () => {
@@ -110,7 +148,7 @@ test("conversation skips the drafting loop: one direct answer, no grading, no fi
   const result = await s.run({ task: "user:\nhi\n\nuser:\nWhy use loops?", request: "Why use loops?" })
   assert.deepEqual(result, { answer: "Because loops catch mistakes.", changed: [], decision: "chat", childID: "child" })
   assert.deepEqual(routed, [{ latest: "Why use loops?", conversation: "user:\nhi\n\nuser:\nWhy use loops?" }])
-  assert.equal(s.evaluations.length, 0); assert.equal(s.prompts.length, 1); assert.equal(s.checklistPrompts.length, 0)
+  assert.equal(s.evaluations.length, 0); assert.equal(s.prompts.length, 1); assert.equal(s.listPrompts.length, 0)
   assert.match(s.prompts[0].body.parts[0].text, /plain Markdown \(not JSON\)/)
   assert.equal(s.creates[0].body.title, "JEV direct answer")
   assert.deepEqual(s.creates[0].body.permission, workerRuleset(), "Direct answers stay read-only")
